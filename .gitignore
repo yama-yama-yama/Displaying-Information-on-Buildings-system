@@ -15,6 +15,7 @@ Desktop.ini
 !/.vscode/extensions.json
 frontend/.vscode/*
 !frontend/.vscode/extensions.json
+server_start.bat
 
 # ============================================================
 # 秘密情報・環境変数

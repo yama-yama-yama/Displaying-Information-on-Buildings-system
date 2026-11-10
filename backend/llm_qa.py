@@ -35,7 +35,7 @@ if sys.platform == 'win32':
 DEFAULT_API_KEY_PATH = os.path.join(os.path.dirname(__file__), "api_KEY.txt")
 # 後方互換のためモジュール読み込み時点の環境変数も保持する（実処理では load_gemini_api_key を使う）
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 # OpenAI 互換 API の既定値（OPENAI_BASE_URL / OPENAI_MODEL で上書き可能）
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"

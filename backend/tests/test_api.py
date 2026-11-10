@@ -4,6 +4,9 @@
 外部依存（Gemini / OpenAI 互換 API / Nominatim / 解析モジュール）はすべてモック化する。
 """
 
+import pytest
+from fastapi import HTTPException
+
 import main
 
 
@@ -178,3 +181,110 @@ def test_ask_llm_only_success(client, monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"prompt": "こんにちは", "answer": "こんにちは！"}
     assert captured == {"prompt": "こんにちは", "model": None}
+
+
+# ==============================================================================
+# /api/tts
+# ==============================================================================
+
+def test_tts_success(client, monkeypatch, tmp_path):
+    audio_file = tmp_path / "answer_test.mp3"
+    audio_file.write_bytes(b"ID3fake")
+    captured = {}
+
+    def fake_tts(text, output_path=None, lang="ja"):
+        captured.update(text=text, lang=lang, output_path=output_path)
+        return str(audio_file)
+
+    monkeypatch.setattr(main, "text_to_speech", fake_tts)
+
+    response = client.post("/api/tts", json={"text": "  こんにちは  ", "lang": "ja"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "text": "こんにちは",
+        "lang": "ja",
+        "audio_path": "/api/audio/answer_test.mp3",
+    }
+    assert captured == {"text": "こんにちは", "lang": "ja", "output_path": None}
+
+
+def test_tts_defaults_to_japanese(client, monkeypatch, tmp_path):
+    audio_file = tmp_path / "answer_default.mp3"
+    audio_file.write_bytes(b"ID3fake")
+    captured = {}
+
+    def fake_tts(text, output_path=None, lang="ja"):
+        captured.update(text=text, lang=lang)
+        return str(audio_file)
+
+    monkeypatch.setattr(main, "text_to_speech", fake_tts)
+
+    response = client.post("/api/tts", json={"text": "hello"})
+
+    assert response.status_code == 200
+    assert response.json()["lang"] == "ja"
+    assert captured["lang"] == "ja"
+
+
+def test_tts_empty_text_returns_400(client):
+    response = client.post("/api/tts", json={"text": "   "})
+    assert response.status_code == 400
+
+
+def test_tts_too_long_text_returns_400(client):
+    response = client.post(
+        "/api/tts", json={"text": "あ" * (main.MAX_TTS_TEXT_CHARS + 1)}
+    )
+    assert response.status_code == 400
+
+
+def test_tts_synthesis_error_returns_502(client, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("gTTS に接続できません")
+
+    monkeypatch.setattr(main, "text_to_speech", boom)
+
+    response = client.post("/api/tts", json={"text": "こんにちは"})
+    assert response.status_code == 502
+
+
+def test_tts_missing_output_file_returns_500(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        main, "text_to_speech", lambda *a, **k: str(tmp_path / "missing.mp3")
+    )
+
+    response = client.post("/api/tts", json={"text": "こんにちは"})
+    assert response.status_code == 500
+
+
+# ==============================================================================
+# /api/audio/{filename}
+# ==============================================================================
+
+def test_get_audio_serves_mp3(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "AUDIO_DIR", str(tmp_path))
+    (tmp_path / "answer_abc.mp3").write_bytes(b"ID3fakecontent")
+
+    response = client.get("/api/audio/answer_abc.mp3")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/mpeg")
+    assert response.content == b"ID3fakecontent"
+
+
+def test_get_audio_missing_returns_404(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "AUDIO_DIR", str(tmp_path))
+
+    response = client.get("/api/audio/not_found.mp3")
+
+    assert response.status_code == 404
+
+
+def test_get_audio_rejects_path_traversal(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "AUDIO_DIR", str(tmp_path))
+
+    with pytest.raises(HTTPException) as exc_info:
+        main.get_audio("..\\secret.mp3")
+
+    assert exc_info.value.status_code == 400

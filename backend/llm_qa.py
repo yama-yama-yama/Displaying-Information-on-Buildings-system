@@ -477,6 +477,34 @@ def build_unique_audio_path(directory=None, ext=".mp3"):
     return os.path.join(directory, filename)
 
 
+def _remove_previous_audio_files(current_path):
+    """新しく生成した音声以外の古い音声ファイルを削除する。
+
+    音声は毎回 `answer_<uuid>.mp3` として保存されるため、同一ディレクトリに
+    残っている古い生成物を消して最新の 1 件だけを残す。
+    再生中のファイルなどで削除に失敗した場合は、処理を止めずに警告だけ出す。
+    """
+    directory = os.path.dirname(os.path.abspath(current_path))
+    current = os.path.realpath(current_path)
+
+    try:
+        names = os.listdir(directory)
+    except OSError as e:
+        print(f"[audio cleanup error] {e}", file=sys.stderr)
+        return
+
+    for name in names:
+        if not (name.startswith("answer_") and name.lower().endswith(".mp3")):
+            continue
+        path = os.path.realpath(os.path.join(directory, name))
+        if path == current:
+            continue
+        try:
+            os.remove(path)
+        except OSError as e:
+            print(f"[audio cleanup error] {e}", file=sys.stderr)
+
+
 def text_to_speech(text, output_path=None, lang="ja"):
     """
     gTTS を使ってテキストを mp3 ファイルに保存する。
@@ -492,6 +520,8 @@ def text_to_speech(text, output_path=None, lang="ja"):
         os.makedirs(parent, exist_ok=True)
     tts = gTTS(text=text, lang=lang)
     tts.save(output_path)
+    # 新しい音声の保存に成功したら、ひとつ前に生成された音声を削除する
+    _remove_previous_audio_files(output_path)
     return output_path
 
 

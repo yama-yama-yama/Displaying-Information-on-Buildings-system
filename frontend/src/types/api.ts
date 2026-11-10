@@ -78,6 +78,17 @@ export interface LlmOnlyResponse {
   answer: string
 }
 
+export interface TtsRequest {
+  text: string
+  lang?: string
+}
+
+export interface TtsResponse {
+  text: string
+  lang: string
+  audio_path: string
+}
+
 export interface FoundTarget {
   name: string
   latitude: number

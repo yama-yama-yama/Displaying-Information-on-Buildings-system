@@ -219,6 +219,62 @@ def test_answer_question_without_audio(monkeypatch):
 
 
 # ==============================================================================
+# text_to_speech: 古い音声ファイルの削除
+# ==============================================================================
+
+class FakeGtts:
+    def __init__(self, text, lang="ja"):
+        self.text = text
+        self.lang = lang
+
+    def save(self, path):
+        with open(path, "wb") as f:
+            f.write(b"new-audio")
+
+
+def test_text_to_speech_removes_previous_audio_files(monkeypatch, tmp_path):
+    old_audio_1 = tmp_path / "answer_old1.mp3"
+    old_audio_1.write_bytes(b"old1")
+    old_audio_2 = tmp_path / "answer_old2.mp3"
+    old_audio_2.write_bytes(b"old2")
+    unrelated = tmp_path / "keep.txt"
+    unrelated.write_text("keep", encoding="utf-8")
+    new_audio = tmp_path / "answer_new.mp3"
+
+    monkeypatch.setattr(llm_qa, "gTTS", FakeGtts)
+
+    result = llm_qa.text_to_speech("新しい音声", output_path=str(new_audio))
+
+    assert result == str(new_audio)
+    assert new_audio.read_bytes() == b"new-audio"
+    # 直前に生成された音声を含め、古い生成物は残らない
+    assert not old_audio_1.exists()
+    assert not old_audio_2.exists()
+    # 生成音声以外のファイルは削除しない
+    assert unrelated.exists()
+
+
+def test_text_to_speech_keeps_previous_audio_when_save_fails(monkeypatch, tmp_path):
+    old_audio = tmp_path / "answer_old.mp3"
+    old_audio.write_bytes(b"old")
+
+    class FailingGtts:
+        def __init__(self, text, lang="ja"):
+            pass
+
+        def save(self, path):
+            raise RuntimeError("save failed")
+
+    monkeypatch.setattr(llm_qa, "gTTS", FailingGtts)
+
+    with pytest.raises(RuntimeError):
+        llm_qa.text_to_speech("失敗", output_path=str(tmp_path / "answer_new.mp3"))
+
+    # 新しい音声の保存に失敗した場合は、前の音声を残す
+    assert old_audio.exists()
+
+
+# ==============================================================================
 # OpenAI 互換 API
 # ==============================================================================
 

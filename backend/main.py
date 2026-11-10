@@ -28,11 +28,11 @@ if sys.platform == 'win32':
 sys.path.insert(0, os.path.dirname(__file__))
 
 from feature_tags import collect_search_tags, is_high_building
-from llm_qa import AUDIO_DIR, answer_question, ask_llm
+from llm_qa import AUDIO_DIR, answer_question, ask_llm, text_to_speech
 from searchsynonyms_mapfeatures_v2 import analyze_and_search
 from transcribe import TranscriptionError, transcribe_bytes
 
-app = FastAPI(title="屋外ナビアシスタント API", version="0.1.0")
+app = FastAPI(title="屋外ナビアシスタント API", version="0.1.2")
 
 # CORS: 開発中はフロントエンド開発サーバーからのリクエストを許可
 app.add_middleware(
@@ -549,11 +549,23 @@ def ask(request: AskRequest):
 # ==============================================================================
 
 MAX_AUDIO_UPLOAD_BYTES = 15 * 1024 * 1024  # 15MB
+MAX_TTS_TEXT_CHARS = 1000
 
 
 class TranscribeResponse(BaseModel):
     text: str
     language: str
+
+
+class TtsRequest(BaseModel):
+    text: str = Field(..., description="音声合成するテキスト")
+    lang: str = Field("ja", description="gTTS の言語コード（例: ja, en）")
+
+
+class TtsResponse(BaseModel):
+    text: str
+    lang: str
+    audio_path: str
 
 
 @app.post("/api/transcribe", response_model=TranscribeResponse)
@@ -581,6 +593,39 @@ async def transcribe(
         raise HTTPException(status_code=500, detail=f"文字起こしに失敗しました: {e}")
 
     return {"text": text, "language": language}
+
+
+@app.post("/api/tts", response_model=TtsResponse)
+def synthesize_speech(request: TtsRequest):
+    """
+    指定されたテキストを gTTS で mp3 に変換し、再生用の URL を返す。
+
+    デバッグ画面からの音声再生テストや、LLM を介さない読み上げに使う。
+    """
+    text = request.text.strip() if request.text else ""
+    if not text:
+        raise HTTPException(status_code=400, detail="text が空です")
+    if len(text) > MAX_TTS_TEXT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"text は {MAX_TTS_TEXT_CHARS} 文字以内で指定してください",
+        )
+
+    lang = (request.lang or "ja").strip() or "ja"
+
+    try:
+        audio_path = text_to_speech(text, lang=lang)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"音声合成に失敗しました: {e}")
+
+    if not audio_path or not os.path.isfile(audio_path):
+        raise HTTPException(status_code=500, detail="音声ファイルの生成に失敗しました")
+
+    return {
+        "text": text,
+        "lang": lang,
+        "audio_path": f"/api/audio/{os.path.basename(audio_path)}",
+    }
 
 
 @app.get("/api/audio/{filename}")

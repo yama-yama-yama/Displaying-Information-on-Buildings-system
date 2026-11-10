@@ -1,8 +1,14 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 import { useGeolocation } from '../composables/useGeolocation'
-import { analyzeText, askLlmOnly, toErrorMessage } from '../services/api'
-import type { AnalyzeResponse, LlmOnlyResponse } from '../types/api'
+import {
+  analyzeText,
+  askLlmOnly,
+  resolveAudioUrl,
+  synthesizeSpeech,
+  toErrorMessage,
+} from '../services/api'
+import type { AnalyzeResponse, LlmOnlyResponse, TtsResponse } from '../types/api'
 
 const { state: location, startWatching, stopWatching } = useGeolocation()
 
@@ -63,6 +69,40 @@ async function runLlmOnly() {
     llmError.value = toErrorMessage(e, 'LLM リクエストに失敗しました')
   } finally {
     llmLoading.value = false
+  }
+}
+
+// gTTS audio generation / playback test
+const ttsText = ref('こんにちは。gTTS の音声再生テストです。')
+const ttsLang = ref('ja')
+const ttsResult = ref<TtsResponse | null>(null)
+const ttsAudioUrl = ref('')
+const ttsError = ref('')
+const ttsLoading = ref(false)
+const ttsAudioRef = ref<HTMLAudioElement | null>(null)
+
+async function runTts() {
+  const text = ttsText.value.trim()
+  if (!text || ttsLoading.value) return
+
+  ttsLoading.value = true
+  ttsError.value = ''
+  ttsResult.value = null
+  ttsAudioUrl.value = ''
+  try {
+    const result = await synthesizeSpeech({ text, lang: ttsLang.value })
+    ttsResult.value = result
+    ttsAudioUrl.value = resolveAudioUrl(result.audio_path) ?? ''
+    await nextTick()
+    try {
+      await ttsAudioRef.value?.play()
+    } catch {
+      // 自動再生がブロックされた場合は controls から再生する
+    }
+  } catch (e) {
+    ttsError.value = toErrorMessage(e, '音声の生成に失敗しました')
+  } finally {
+    ttsLoading.value = false
   }
 }
 </script>
@@ -127,6 +167,34 @@ async function runLlmOnly() {
       <div v-if="llmResult" class="result-box">
         <strong>回答:</strong>
         <p>{{ llmResult.answer }}</p>
+      </div>
+    </section>
+
+    <section class="debug-section">
+      <h2>4. gTTS 音声生成・再生テスト</h2>
+      <label class="block-label">
+        読み上げテキスト
+        <textarea v-model="ttsText" rows="3" />
+      </label>
+      <label>
+        言語
+        <select v-model="ttsLang">
+          <option value="ja">日本語 (ja)</option>
+          <option value="en">英語 (en)</option>
+          <option value="ko">韓国語 (ko)</option>
+          <option value="zh-CN">中国語 (zh-CN)</option>
+        </select>
+      </label>
+      <button type="button" :disabled="ttsLoading || !ttsText.trim()" @click="runTts">
+        {{ ttsLoading ? '生成中...' : '音声を生成して再生' }}
+      </button>
+      <p v-if="ttsError" class="error-box">{{ ttsError }}</p>
+      <div v-if="ttsResult && ttsAudioUrl" class="result-box audio-result">
+        <p>
+          <strong>音声 URL:</strong>
+          <code>{{ ttsAudioUrl }}</code>
+        </p>
+        <audio ref="ttsAudioRef" class="tts-audio" :src="ttsAudioUrl" controls></audio>
       </div>
     </section>
   </div>
@@ -196,7 +264,8 @@ label {
 }
 
 input,
-textarea {
+textarea,
+select {
   padding: 0.5rem;
   border: 1px solid var(--color-border);
   border-radius: 0.375rem;
@@ -206,7 +275,8 @@ textarea {
 }
 
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   outline: none;
   border-color: hsla(160, 100%, 37%, 1);
 }
@@ -234,5 +304,19 @@ textarea:focus {
   max-height: 400px;
   font-family: monospace;
   font-size: 0.8125rem;
+}
+
+.audio-result {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.audio-result code {
+  word-break: break-all;
+}
+
+.tts-audio {
+  width: 100%;
 }
 </style>

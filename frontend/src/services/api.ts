@@ -5,6 +5,8 @@ import type {
   AskResponse,
   LlmOnlyRequest,
   LlmOnlyResponse,
+  TtsRequest,
+  TtsResponse,
 } from '@/types/api'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
@@ -41,6 +43,16 @@ export async function askQuestion(request: AskRequest): Promise<AskResponse> {
 
 export async function askLlmOnly(request: LlmOnlyRequest): Promise<LlmOnlyResponse> {
   return fetchJson<LlmOnlyResponse>(`${API_BASE_URL}/api/ask-llm-only`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  })
+}
+
+/**
+ * gTTS でテキストから mp3 を生成し、再生用のパスを受け取る。
+ */
+export async function synthesizeSpeech(request: TtsRequest): Promise<TtsResponse> {
+  return fetchJson<TtsResponse>(`${API_BASE_URL}/api/tts`, {
     method: 'POST',
     body: JSON.stringify(request),
   })

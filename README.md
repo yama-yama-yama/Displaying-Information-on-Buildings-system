@@ -125,6 +125,7 @@ VITE_API_BASE_URL=http://localhost:8000
 | POST | `/api/ask` | 質問と現在地から建物を特定し、LLM が案内回答を生成 |
 | POST | `/api/ask-llm-only` | プロンプトをそのまま LLM（Gemini / OpenAI 互換を自動選択）に送信 |
 | POST | `/api/transcribe` | 音声ファイルを文字起こし（multipart: `file`） |
+| POST | `/api/tts` | テキストを gTTS で音声 (mp3) に変換し、再生用パスを返す |
 | GET | `/api/audio/{filename}` | 生成された回答音声 (mp3) を配信 |
 
 ### リクエスト例
@@ -137,6 +138,19 @@ curl -X POST http://localhost:8000/api/ask \
 
 `generate_audio: true` の場合、レスポンスの `audio_path` に
 `/api/audio/xxxx.mp3` が入ります。
+
+### 音声再生テスト
+
+デバッグ画面 (`/debug`) の「4. gTTS 音声生成・再生テスト」から、任意のテキストを
+音声化してその場で再生できます。新しい音声を生成すると、ひとつ前に生成された
+音声ファイルは自動的に削除され、最新の 1 件だけが残ります。
+API 単体で試す場合は次のとおりです。
+
+```bash
+curl -X POST http://localhost:8000/api/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"こんにちは","lang":"ja"}'
+```
 
 ## 位置検索のタグマージ方針
 

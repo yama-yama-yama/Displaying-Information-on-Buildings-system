@@ -124,11 +124,15 @@ Vercel のサーバーレス環境ではファイルシステムが永続化さ�
 - `BLOB_READ_WRITE_TOKEN` が未設定または空: 従来どおり `backend/audio` に保存し、
   `audio_path` に `/api/audio/{filename}` を返します。
 - `BLOB_READ_WRITE_TOKEN` が設定済み: gTTS の mp3 を Vercel Blob の `audio/` に
-  アップロードし、`audio_path` に Blob の公開 URL を返します。ローカルの一時
-  ファイルはアップロード後に削除されます。
+  アップロードします。ローカルの一時ファイルはアップロード後に削除されます。
 
-Blob ストアはブラウザの `<audio>` から直接再生できるよう、公開（Public）アクセスで
-作成してください。新しい音声を生成すると、Blob 上の直前の音声も自動削除されます。
+Blob のアクセス設定は既定で `private` です。private ストアの音声はブラウザから
+直接開けないため、`audio_path` には `/api/audio/{filename}` を返し、バックエンドが
+Vercel Blob から取得してストリーミング配信します。フロントエンドは
+`VITE_API_BASE_URL` に設定したバックエンドの URL 経由で再生します。
+公開（Public）ストアを使う場合のみ `BLOB_ACCESS=public` を設定してください。
+
+新しい音声を生成すると、Blob 上の直前の音声も自動削除されます。
 
 ## API
 
@@ -151,7 +155,8 @@ curl -X POST http://localhost:8000/api/ask \
 ```
 
 `generate_audio: true` の場合、レスポンスの `audio_path` に
-`/api/audio/xxxx.mp3`（Vercel Blob 使用時は Blob の公開 URL）が入ります。
+`/api/audio/xxxx.mp3` が入ります。フロントエンドはバックエンドの URL を前置して
+再生します（Vercel Blob 使用時も同じパスで、バックエンドが Blob から配信します）。
 
 ### 音声再生テスト
 

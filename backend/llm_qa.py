@@ -53,6 +53,8 @@ AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
 
 # Vercel Blob に保存する場合の環境変数とパス接頭辞
 BLOB_TOKEN_ENV = "BLOB_READ_WRITE_TOKEN"
+BLOB_ACCESS_ENV = "BLOB_ACCESS"
+BLOB_DEFAULT_ACCESS = "private"
 AUDIO_BLOB_PREFIX = "audio/"
 
 
@@ -515,6 +517,17 @@ def blob_storage_enabled():
     return bool(os.environ.get(BLOB_TOKEN_ENV, "").strip())
 
 
+def _blob_access():
+    """
+    Blob ストアのアクセス設定。
+
+    既定は private。公開ストアを使う場合のみ `BLOB_ACCESS=public` を設定する。
+    private ストアの音声はバックエンド経由で配信する。
+    """
+    access = os.environ.get(BLOB_ACCESS_ENV, BLOB_DEFAULT_ACCESS).strip().lower()
+    return access if access in {"public", "private"} else BLOB_DEFAULT_ACCESS
+
+
 def _load_blob_sdk():
     """Vercel Blob SDK を遅延読み込みする（ローカル実行時の依存を避ける）。"""
     from vercel.blob import sync as blob
@@ -523,22 +536,42 @@ def _load_blob_sdk():
 
 
 def _upload_audio_to_blob(path):
-    """生成した mp3 を Vercel Blob に保存し、(公開 URL, pathname) を返す。"""
+    """生成した mp3 を Vercel Blob に保存し、(URL, pathname) を返す。"""
     blob = _load_blob_sdk()
     pathname = f"{AUDIO_BLOB_PREFIX}{os.path.basename(path)}"
     with open(path, "rb") as f:
         data = f.read()
 
     # 音声は短命なので、CDN キャッシュも短めにする（最小 60 秒）
-    # ブラウザの <audio> から直接再生できるよう、公開ストアに保存する
     result = blob.put_blob(
         pathname,
         data,
-        access="public",
+        access=_blob_access(),
         content_type="audio/mpeg",
         cache_control_max_age=60,
     )
     return result.url, result.pathname
+
+
+def get_audio_from_blob(filename):
+    """
+    Vercel Blob から音声を取得する。
+
+    private ストアの音声はブラウザから直接 URL を開けないため、
+    `/api/audio/{filename}` 経由で配信するときに使う。
+
+    :return: (音声データ, Content-Type)
+    """
+    blob = _load_blob_sdk()
+    pathname = f"{AUDIO_BLOB_PREFIX}{os.path.basename(filename)}"
+    try:
+        result = blob.get_blob(pathname, access=_blob_access())
+    except blob.BlobNotFoundError as e:
+        # 呼び出し側で 404 として扱えるように変換する
+        raise FileNotFoundError(filename) from e
+
+    media_type = result.metadata.content_type or "audio/mpeg"
+    return result.body, media_type
 
 
 def _remove_previous_blobs(current_pathname):

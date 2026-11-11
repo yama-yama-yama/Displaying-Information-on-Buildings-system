@@ -11,11 +11,12 @@ import os
 import re
 import sys
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 if sys.platform == 'win32':
@@ -28,7 +29,14 @@ if sys.platform == 'win32':
 sys.path.insert(0, os.path.dirname(__file__))
 
 from feature_tags import collect_search_tags, is_high_building
-from llm_qa import AUDIO_DIR, answer_question, ask_llm, text_to_speech
+from llm_qa import (
+    AUDIO_DIR,
+    answer_question,
+    ask_llm,
+    blob_storage_enabled,
+    get_audio_from_blob,
+    text_to_speech,
+)
 from searchsynonyms_mapfeatures_v2 import analyze_and_search
 from transcribe import TranscriptionError, transcribe_bytes
 
@@ -78,13 +86,17 @@ def _to_audio_url(audio_path: Optional[str]) -> Optional[str]:
     """
     音声の出力先を、フロントエンドから再生できる URL に変換する。
 
-    ローカル保存時は `/api/audio/{filename}`、Vercel Blob 保存時は
-    生成時に返された絶対 URL をそのまま使う。
+    Vercel Blob 保存時は、private ストアでも再生できるよう
+    バックエンドの `/api/audio/{filename}` 経由の URL を返す。
+    ローカル保存時も同じパスを使う。
     """
     if not audio_path:
         return None
     if _is_remote_audio(audio_path):
-        return audio_path
+        if not blob_storage_enabled():
+            return audio_path
+        filename = os.path.basename(urlparse(audio_path).path)
+        return f"/api/audio/{filename}"
     return f"/api/audio/{os.path.basename(audio_path)}"
 
 
@@ -654,6 +666,22 @@ def get_audio(filename: str):
     # パストラバーサル対策: 単純なファイル名のみ許可する
     if filename != os.path.basename(filename) or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="不正なファイル名です")
+
+    # Vercel Blob（private ストア）の音声はバックエンド経由で配信する
+    if blob_storage_enabled():
+        try:
+            data, media_type = get_audio_from_blob(filename)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="音声ファイルが見つかりません")
+        except Exception as e:
+            print(f"[blob audio error] {e}", file=sys.stderr)
+            raise HTTPException(status_code=502, detail="音声ファイルの取得に失敗しました")
+
+        return Response(
+            content=data,
+            media_type=media_type,
+            headers={"Cache-Control": "private, max-age=60"},
+        )
 
     base_dir = os.path.realpath(AUDIO_DIR)
     audio_path = os.path.realpath(os.path.join(base_dir, filename))

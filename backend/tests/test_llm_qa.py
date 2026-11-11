@@ -349,13 +349,14 @@ def test_text_to_speech_keeps_previous_blob_when_upload_fails(monkeypatch, tmp_p
     assert list(tmp_path.glob("answer_*.mp3")) == []
 
 
-def test_upload_audio_to_blob_uses_public_audio_blob(monkeypatch, tmp_path):
+def test_upload_audio_to_blob_uses_private_access_by_default(monkeypatch, tmp_path):
     audio = tmp_path / "answer_x.mp3"
     audio.write_bytes(b"mp3-data")
     captured = {}
+    monkeypatch.delenv(llm_qa.BLOB_ACCESS_ENV, raising=False)
 
     class FakeResult:
-        url = "https://store.public.blob.vercel-storage.com/audio/answer_x.mp3"
+        url = "https://store.private.blob.vercel-storage.com/audio/answer_x.mp3"
         pathname = "audio/answer_x.mp3"
 
     class FakeBlob:
@@ -371,8 +372,69 @@ def test_upload_audio_to_blob_uses_public_audio_blob(monkeypatch, tmp_path):
     assert pathname == FakeResult.pathname
     assert captured["pathname"] == "audio/answer_x.mp3"
     assert captured["body"] == b"mp3-data"
-    assert captured["options"]["access"] == "public"
+    assert captured["options"]["access"] == "private"
     assert captured["options"]["content_type"] == "audio/mpeg"
+
+
+def test_upload_audio_to_blob_supports_public_store(monkeypatch, tmp_path):
+    audio = tmp_path / "answer_x.mp3"
+    audio.write_bytes(b"mp3-data")
+    captured = {}
+    monkeypatch.setenv(llm_qa.BLOB_ACCESS_ENV, "public")
+
+    class FakeResult:
+        url = "https://store.public.blob.vercel-storage.com/audio/answer_x.mp3"
+        pathname = "audio/answer_x.mp3"
+
+    class FakeBlob:
+        def put_blob(self, pathname, body, **options):
+            captured.update(options)
+            return FakeResult()
+
+    monkeypatch.setattr(llm_qa, "_load_blob_sdk", lambda: FakeBlob())
+
+    llm_qa._upload_audio_to_blob(str(audio))
+
+    assert captured["access"] == "public"
+
+
+def test_get_audio_from_blob_uses_private_access(monkeypatch):
+    captured = {}
+
+    class FakeMetadata:
+        content_type = "audio/mpeg"
+
+    class FakeResult:
+        metadata = FakeMetadata()
+        body = b"blob-audio"
+
+    class FakeBlob:
+        def get_blob(self, pathname, **options):
+            captured.update(pathname=pathname, **options)
+            return FakeResult()
+
+    monkeypatch.setattr(llm_qa, "_load_blob_sdk", lambda: FakeBlob())
+    monkeypatch.delenv(llm_qa.BLOB_ACCESS_ENV, raising=False)
+
+    body, media_type = llm_qa.get_audio_from_blob("answer_x.mp3")
+
+    assert body == b"blob-audio"
+    assert media_type == "audio/mpeg"
+    assert captured == {"pathname": "audio/answer_x.mp3", "access": "private"}
+
+
+def test_get_audio_from_blob_converts_not_found_to_file_not_found(monkeypatch):
+    class FakeBlob:
+        class BlobNotFoundError(Exception):
+            pass
+
+        def get_blob(self, pathname, **options):
+            raise self.BlobNotFoundError("not found")
+
+    monkeypatch.setattr(llm_qa, "_load_blob_sdk", lambda: FakeBlob())
+
+    with pytest.raises(FileNotFoundError):
+        llm_qa.get_audio_from_blob("missing.mp3")
 
 
 def test_remove_previous_blobs_deletes_only_old_files(monkeypatch):

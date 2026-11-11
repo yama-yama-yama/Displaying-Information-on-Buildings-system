@@ -69,6 +69,25 @@ class AnalyzeResponse(BaseModel):
     top_results: list
 
 
+def _is_remote_audio(audio_path: str) -> bool:
+    """Vercel Blob などの絶対 URL かどうか。"""
+    return audio_path.startswith(("http://", "https://"))
+
+
+def _to_audio_url(audio_path: Optional[str]) -> Optional[str]:
+    """
+    音声の出力先を、フロントエンドから再生できる URL に変換する。
+
+    ローカル保存時は `/api/audio/{filename}`、Vercel Blob 保存時は
+    生成時に返された絶対 URL をそのまま使う。
+    """
+    if not audio_path:
+        return None
+    if _is_remote_audio(audio_path):
+        return audio_path
+    return f"/api/audio/{os.path.basename(audio_path)}"
+
+
 class AskResponse(BaseModel):
     question: str
     answer: str
@@ -532,8 +551,7 @@ def ask(request: AskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"回答生成に失敗しました: {e}")
 
-    audio_path = llm_result.get("audio_path")
-    audio_url = f"/api/audio/{os.path.basename(audio_path)}" if audio_path else None
+    audio_url = _to_audio_url(llm_result.get("audio_path"))
 
     return {
         "question": request.question,
@@ -618,13 +636,15 @@ def synthesize_speech(request: TtsRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"音声合成に失敗しました: {e}")
 
-    if not audio_path or not os.path.isfile(audio_path):
+    if not audio_path:
+        raise HTTPException(status_code=500, detail="音声ファイルの生成に失敗しました")
+    if not _is_remote_audio(audio_path) and not os.path.isfile(audio_path):
         raise HTTPException(status_code=500, detail="音声ファイルの生成に失敗しました")
 
     return {
         "text": text,
         "lang": lang,
-        "audio_path": f"/api/audio/{os.path.basename(audio_path)}",
+        "audio_path": _to_audio_url(audio_path),
     }
 
 

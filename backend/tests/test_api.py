@@ -112,6 +112,24 @@ def test_ask_empty_question_returns_400(client):
     assert response.status_code == 400
 
 
+def test_ask_supports_blob_audio_url(client, monkeypatch, fake_analysis, fake_nominatim):
+    """/api/ask は Vercel Blob の絶対 URL をそのまま返す。"""
+    monkeypatch.setattr(main, "analyze_and_search", lambda *a, **k: fake_analysis)
+    monkeypatch.setattr(main, "nominatim_search", lambda *a, **k: fake_nominatim)
+
+    blob_url = "https://store.public.blob.vercel-storage.com/audio/answer_x.mp3"
+    monkeypatch.setattr(
+        main,
+        "answer_question",
+        lambda **kwargs: {"answer": "回答", "audio_path": blob_url, "prompt": "p"},
+    )
+
+    response = client.post("/api/ask", json={"question": "スタバはどこ？"})
+
+    assert response.status_code == 200
+    assert response.json()["audio_path"] == blob_url
+
+
 def test_ask_gemini_error_returns_500(client, monkeypatch, fake_analysis, fake_nominatim):
     monkeypatch.setattr(main, "analyze_and_search", lambda *a, **k: fake_analysis)
     monkeypatch.setattr(main, "nominatim_search", lambda *a, **k: fake_nominatim)
@@ -186,6 +204,17 @@ def test_ask_llm_only_success(client, monkeypatch):
 # ==============================================================================
 # /api/tts
 # ==============================================================================
+
+def test_tts_returns_blob_url_as_is(client, monkeypatch):
+    """Vercel Blob に保存した場合は絶対 URL をそのまま返す。"""
+    blob_url = "https://store.public.blob.vercel-storage.com/audio/answer_x.mp3"
+    monkeypatch.setattr(main, "text_to_speech", lambda *a, **k: blob_url)
+
+    response = client.post("/api/tts", json={"text": "こんにちは", "lang": "ja"})
+
+    assert response.status_code == 200
+    assert response.json()["audio_path"] == blob_url
+
 
 def test_tts_success(client, monkeypatch, tmp_path):
     audio_file = tmp_path / "answer_test.mp3"

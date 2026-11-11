@@ -116,6 +116,20 @@ VITE_API_BASE_URL=http://localhost:8000
 ブラウザが Web Speech API に対応している場合は、音声認識をブラウザ内で行うため
 `ffmpeg` は不要です。
 
+### Vercel Blob への音声保存
+
+Vercel のサーバーレス環境ではファイルシステムが永続化されないため、
+生成した音声は Vercel Blob に保存できます。
+
+- `BLOB_READ_WRITE_TOKEN` が未設定または空: 従来どおり `backend/audio` に保存し、
+  `audio_path` に `/api/audio/{filename}` を返します。
+- `BLOB_READ_WRITE_TOKEN` が設定済み: gTTS の mp3 を Vercel Blob の `audio/` に
+  アップロードし、`audio_path` に Blob の公開 URL を返します。ローカルの一時
+  ファイルはアップロード後に削除されます。
+
+Blob ストアはブラウザの `<audio>` から直接再生できるよう、公開（Public）アクセスで
+作成してください。新しい音声を生成すると、Blob 上の直前の音声も自動削除されます。
+
 ## API
 
 | メソッド | パス | 説明 |
@@ -137,7 +151,7 @@ curl -X POST http://localhost:8000/api/ask \
 ```
 
 `generate_audio: true` の場合、レスポンスの `audio_path` に
-`/api/audio/xxxx.mp3` が入ります。
+`/api/audio/xxxx.mp3`（Vercel Blob 使用時は Blob の公開 URL）が入ります。
 
 ### 音声再生テスト
 

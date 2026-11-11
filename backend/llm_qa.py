@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import uuid
 
 import requests
@@ -49,6 +50,10 @@ WEB_SEARCH_ENV = "LLM_WEB_SEARCH"
 DEFAULT_AUDIO_PATH = "answer.mp3"
 # 生成した mp3 を保存するディレクトリ（GET /api/audio/{filename} から配信する）
 AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
+
+# Vercel Blob に保存する場合の環境変数とパス接頭辞
+BLOB_TOKEN_ENV = "BLOB_READ_WRITE_TOKEN"
+AUDIO_BLOB_PREFIX = "audio/"
 
 
 SYSTEM_PROMPT = """あなたは屋外ナビゲーションアシスタントです。
@@ -505,21 +510,100 @@ def _remove_previous_audio_files(current_path):
             print(f"[audio cleanup error] {e}", file=sys.stderr)
 
 
+def blob_storage_enabled():
+    """BLOB_READ_WRITE_TOKEN が設定されている場合は Vercel Blob を使う。"""
+    return bool(os.environ.get(BLOB_TOKEN_ENV, "").strip())
+
+
+def _load_blob_sdk():
+    """Vercel Blob SDK を遅延読み込みする（ローカル実行時の依存を避ける）。"""
+    from vercel.blob import sync as blob
+
+    return blob
+
+
+def _upload_audio_to_blob(path):
+    """生成した mp3 を Vercel Blob に保存し、(公開 URL, pathname) を返す。"""
+    blob = _load_blob_sdk()
+    pathname = f"{AUDIO_BLOB_PREFIX}{os.path.basename(path)}"
+    with open(path, "rb") as f:
+        data = f.read()
+
+    # 音声は短命なので、CDN キャッシュも短めにする（最小 60 秒）
+    # ブラウザの <audio> から直接再生できるよう、公開ストアに保存する
+    result = blob.put_blob(
+        pathname,
+        data,
+        access="public",
+        content_type="audio/mpeg",
+        cache_control_max_age=60,
+    )
+    return result.url, result.pathname
+
+
+def _remove_previous_blobs(current_pathname):
+    """Vercel Blob 上の古い生成音声を削除し、最新の 1 件だけ残す。"""
+    blob = _load_blob_sdk()
+    try:
+        items = list(blob.query_blobs(prefix=AUDIO_BLOB_PREFIX))
+    except Exception as e:
+        print(f"[audio cleanup error] {e}", file=sys.stderr)
+        return
+
+    for item in items:
+        if item.pathname == current_pathname:
+            continue
+        try:
+            blob.delete_blob(item.pathname)
+        except Exception as e:
+            print(f"[audio cleanup error] {e}", file=sys.stderr)
+
+
 def text_to_speech(text, output_path=None, lang="ja"):
     """
     gTTS を使ってテキストを mp3 ファイルに保存する。
 
-    :param output_path: None の場合は `AUDIO_DIR` に一意な名前で保存する。
+    `BLOB_READ_WRITE_TOKEN` が設定されている場合は Vercel Blob に保存し、
+    公開 URL を返す。未設定の場合は従来どおり `AUDIO_DIR` に保存して
+    ローカルパスを返す。
+
+    :param output_path: None の場合は自動で出力先を決める。
     """
     if not text:
         return None
+
+    use_blob = blob_storage_enabled()
+    generated_temp = output_path is None and use_blob
+
     if output_path is None:
-        output_path = build_unique_audio_path()
+        if use_blob:
+            # Vercel のファイルシステムは読み取り専用のため、一時ディレクトリに書く
+            output_path = os.path.join(
+                tempfile.gettempdir(),
+                f"answer_{uuid.uuid4().hex[:12]}.mp3",
+            )
+        else:
+            output_path = build_unique_audio_path()
     else:
         parent = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(parent, exist_ok=True)
+
     tts = gTTS(text=text, lang=lang)
     tts.save(output_path)
+
+    if use_blob:
+        try:
+            url, pathname = _upload_audio_to_blob(output_path)
+        finally:
+            if generated_temp:
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+        # 新しい音声の保存に成功したら、ひとつ前に生成された音声を削除する
+        _remove_previous_blobs(pathname)
+        return url
+
     # 新しい音声の保存に成功したら、ひとつ前に生成された音声を削除する
     _remove_previous_audio_files(output_path)
     return output_path

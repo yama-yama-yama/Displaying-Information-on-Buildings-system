@@ -4,6 +4,7 @@
 Gemini / gTTS は外部通信するためモック化する。
 """
 
+import os
 import sys
 import types
 
@@ -233,6 +234,7 @@ class FakeGtts:
 
 
 def test_text_to_speech_removes_previous_audio_files(monkeypatch, tmp_path):
+    monkeypatch.delenv(llm_qa.BLOB_TOKEN_ENV, raising=False)
     old_audio_1 = tmp_path / "answer_old1.mp3"
     old_audio_1.write_bytes(b"old1")
     old_audio_2 = tmp_path / "answer_old2.mp3"
@@ -255,6 +257,7 @@ def test_text_to_speech_removes_previous_audio_files(monkeypatch, tmp_path):
 
 
 def test_text_to_speech_keeps_previous_audio_when_save_fails(monkeypatch, tmp_path):
+    monkeypatch.delenv(llm_qa.BLOB_TOKEN_ENV, raising=False)
     old_audio = tmp_path / "answer_old.mp3"
     old_audio.write_bytes(b"old")
 
@@ -272,6 +275,129 @@ def test_text_to_speech_keeps_previous_audio_when_save_fails(monkeypatch, tmp_pa
 
     # 新しい音声の保存に失敗した場合は、前の音声を残す
     assert old_audio.exists()
+
+
+# ==============================================================================
+# text_to_speech: Vercel Blob 保存
+# ==============================================================================
+
+def test_blob_storage_enabled_requires_token(monkeypatch):
+    monkeypatch.delenv(llm_qa.BLOB_TOKEN_ENV, raising=False)
+    assert llm_qa.blob_storage_enabled() is False
+
+    monkeypatch.setenv(llm_qa.BLOB_TOKEN_ENV, "   ")
+    assert llm_qa.blob_storage_enabled() is False
+
+    monkeypatch.setenv(llm_qa.BLOB_TOKEN_ENV, "vercel_blob_rw_test")
+    assert llm_qa.blob_storage_enabled() is True
+
+
+def test_text_to_speech_saves_to_blob_when_token_is_set(monkeypatch, tmp_path):
+    monkeypatch.setenv(llm_qa.BLOB_TOKEN_ENV, "vercel_blob_rw_test")
+    monkeypatch.setattr(llm_qa.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(llm_qa, "gTTS", FakeGtts)
+
+    blob_url = (
+        "https://store.public.blob.vercel-storage.com/audio/answer_new.mp3"
+    )
+    captured = {}
+
+    def fake_upload(path):
+        captured["uploaded_path"] = path
+        with open(path, "rb") as f:
+            captured["content"] = f.read()
+        return blob_url, "audio/answer_new.mp3"
+
+    monkeypatch.setattr(llm_qa, "_upload_audio_to_blob", fake_upload)
+    monkeypatch.setattr(
+        llm_qa,
+        "_remove_previous_blobs",
+        lambda pathname: captured.update(cleanup_pathname=pathname),
+    )
+
+    result = llm_qa.text_to_speech("新しい音声")
+
+    assert result == blob_url
+    assert captured["content"] == b"new-audio"
+    assert captured["cleanup_pathname"] == "audio/answer_new.mp3"
+    # ローカルの一時ファイルはアップロード後に削除される
+    assert not os.path.exists(captured["uploaded_path"])
+    assert list(tmp_path.glob("answer_*.mp3")) == []
+
+
+def test_text_to_speech_keeps_previous_blob_when_upload_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv(llm_qa.BLOB_TOKEN_ENV, "vercel_blob_rw_test")
+    monkeypatch.setattr(llm_qa.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(llm_qa, "gTTS", FakeGtts)
+
+    def fail_upload(path):
+        raise RuntimeError("upload failed")
+
+    cleanup_called = []
+    monkeypatch.setattr(llm_qa, "_upload_audio_to_blob", fail_upload)
+    monkeypatch.setattr(
+        llm_qa,
+        "_remove_previous_blobs",
+        lambda pathname: cleanup_called.append(pathname),
+    )
+
+    with pytest.raises(RuntimeError):
+        llm_qa.text_to_speech("失敗")
+
+    # アップロードに失敗した場合は古い音声を消さず、一時ファイルだけ片付ける
+    assert cleanup_called == []
+    assert list(tmp_path.glob("answer_*.mp3")) == []
+
+
+def test_upload_audio_to_blob_uses_public_audio_blob(monkeypatch, tmp_path):
+    audio = tmp_path / "answer_x.mp3"
+    audio.write_bytes(b"mp3-data")
+    captured = {}
+
+    class FakeResult:
+        url = "https://store.public.blob.vercel-storage.com/audio/answer_x.mp3"
+        pathname = "audio/answer_x.mp3"
+
+    class FakeBlob:
+        def put_blob(self, pathname, body, **options):
+            captured.update(pathname=pathname, body=body, options=options)
+            return FakeResult()
+
+    monkeypatch.setattr(llm_qa, "_load_blob_sdk", lambda: FakeBlob())
+
+    url, pathname = llm_qa._upload_audio_to_blob(str(audio))
+
+    assert url == FakeResult.url
+    assert pathname == FakeResult.pathname
+    assert captured["pathname"] == "audio/answer_x.mp3"
+    assert captured["body"] == b"mp3-data"
+    assert captured["options"]["access"] == "public"
+    assert captured["options"]["content_type"] == "audio/mpeg"
+
+
+def test_remove_previous_blobs_deletes_only_old_files(monkeypatch):
+    class FakeItem:
+        def __init__(self, pathname):
+            self.pathname = pathname
+
+    class FakeBlob:
+        def query_blobs(self, prefix=None):
+            assert prefix == llm_qa.AUDIO_BLOB_PREFIX
+            return [
+                FakeItem("audio/answer_old1.mp3"),
+                FakeItem("audio/answer_new.mp3"),
+                FakeItem("audio/answer_old2.mp3"),
+            ]
+
+        def delete_blob(self, pathname):
+            deleted.append(pathname)
+
+    deleted = []
+    monkeypatch.setattr(llm_qa, "_load_blob_sdk", lambda: FakeBlob())
+
+    llm_qa._remove_previous_blobs("audio/answer_new.mp3")
+
+    assert deleted == ["audio/answer_old1.mp3", "audio/answer_old2.mp3"]
 
 
 # ==============================================================================

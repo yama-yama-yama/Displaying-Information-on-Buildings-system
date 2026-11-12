@@ -40,7 +40,7 @@ from llm_qa import (
 from searchsynonyms_mapfeatures_v2 import analyze_and_search
 from transcribe import TranscriptionError, transcribe_bytes
 
-app = FastAPI(title="屋外ナビアシスタント API", version="0.1.2")
+app = FastAPI(title="屋外ナビアシスタント API", version="0.1.3")
 
 # CORS: 開発中はフロントエンド開発サーバーからのリクエストを許可
 app.add_middleware(

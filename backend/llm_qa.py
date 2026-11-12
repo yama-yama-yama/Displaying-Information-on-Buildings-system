@@ -219,10 +219,10 @@ def build_prompt(geolocate_result, question, current_location=None, facing=None)
         f"{candidate_block}\n"
         f"{location_block}\n"
         f"【ユーザーの質問】\n{question}\n\n"
-        f"上記をもとに、ユーザーが目的の場所にスムーズにたどり着けるよう案内してください。"
     )
     return prompt
-
+#↓をpromptに含まないことで生成を早くできるかのテスト
+#f"上記をもとに、ユーザーが目的の場所にスムーズにたどり着けるよう案内してください。"
 
 def ask_gemini(prompt, api_key=None, model=None, web_search=None):
     """

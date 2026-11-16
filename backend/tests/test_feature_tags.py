@@ -97,6 +97,19 @@ def test_collect_search_tags_no_supplement_for_cafe():
     assert "man_made=tower" not in tags
 
 
+def test_collect_search_tags_raises_threshold_when_expanded_tags_exist():
+    analysis = {"expanded_tags": ["leisure=stadium"], "feature_keywords": []}
+    top_results = [
+        {"class": "building", "value": "home", "score": 0.80},
+        {"class": "building", "value": "stadium", "score": 1.0},
+    ]
+
+    tags = feature_tags.collect_search_tags(analysis, top_results=top_results)
+
+    assert tags == ["leisure=stadium", "building=stadium"]
+    assert "building=home" not in tags
+
+
 def test_collect_search_tags_respects_max_tags():
     analysis = {"expanded_tags": ["amenity=cafe"], "feature_keywords": ["高層ビル"]}
     tags = feature_tags.collect_search_tags(analysis, max_tags=3)

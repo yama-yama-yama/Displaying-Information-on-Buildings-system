@@ -95,6 +95,11 @@ def collect_search_tags(
     tags = []
     seen = set()
 
+    # 固有名詞・接尾辞から高信頼タグが得られている場合は、
+    # 類似度検索のノイズ（dome→home など）を混ぜないよう閾値を上げる。
+    if analysis.get("expanded_tags"):
+        min_score = max(min_score, 0.85)
+
     def add(tag):
         if not isinstance(tag, str):
             return

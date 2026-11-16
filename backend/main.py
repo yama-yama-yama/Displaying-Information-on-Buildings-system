@@ -6,10 +6,13 @@ FastAPI バックエンドエントリポイント
 LLM とジオコーディングを使って建物を特定し、案内回答を返す。
 """
 
+import json
 import math
 import os
 import re
 import sys
+import time
+from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -39,6 +42,18 @@ from llm_qa import (
 )
 from searchsynonyms_mapfeatures_v2 import analyze_and_search
 from transcribe import TranscriptionError, transcribe_bytes
+
+# ==============================================================================
+# 外部 API 共通設定
+# ==============================================================================
+
+# OSM (Nominatim / Overpass) は連絡先付き User-Agent を要求する。
+# example.com を含む UA は 403/406 で拒否されるため、実アドレスを既定にする。
+HTTP_USER_AGENT = os.getenv(
+    "OSM_USER_AGENT",
+    "gps-buildings-info/0.1 (yamayama.sc.1514@gmail.com)",
+)
+OSM_HEADERS = {"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"}
 
 app = FastAPI(title="屋外ナビアシスタント API", version="0.1.3")
 
@@ -114,6 +129,9 @@ class AskResponse(BaseModel):
 
 EARTH_RADIUS_M = 6371000
 
+# Nominatim の全国検索（bounded=0）で、現在地からこれ以上離れた候補は採用しない
+NOMINATIM_MAX_DISTANCE_M = 50000
+
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """2点間の距離（メートル）を返す。"""
@@ -141,43 +159,99 @@ def vector_to_cardinal(bearing: float) -> str:
     return directions[idx]
 
 
+def _closest_nominatim_result(results, lat, lon, max_distance_m):
+    """Nominatim の結果から、現在地に最も近い 1 件を返す（遠すぎるものは除外）。"""
+    best = None
+    best_distance = None
+    for item in results or []:
+        try:
+            item_lat = float(item.get("lat"))
+            item_lon = float(item.get("lon"))
+        except (TypeError, ValueError):
+            continue
+        distance = haversine(lat, lon, item_lat, item_lon)
+        if distance > max_distance_m:
+            continue
+        if best_distance is None or distance < best_distance:
+            best = item
+            best_distance = distance
+    return best
+
+
 def nominatim_search(query: str, lat: Optional[float] = None, lon: Optional[float] = None) -> Optional[dict]:
     """
     Nominatim で施設・地名を検索する。
-    現在地が与えられた場合は近傍を優先するため viewbox を付与する。
+
+    現在地が与えられた場合は、まず viewbox 内（bounded=1）を検索し、
+    0件なら viewbox 優先（bounded=0）で再試行する。
+    bounded=0 は全国・海外の結果も返すため、現在地から遠すぎる候補は捨てて
+    周辺の Overpass 検索に委ねる。
     """
     url = "https://nominatim.openstreetmap.org/search"
-    params = {
+    base_params = {
         "q": query,
         "format": "json",
         "limit": "5",
         "addressdetails": "1",
         "accept-language": "ja",
     }
+
+    attempts = [(None, None)]
     if lat is not None and lon is not None:
         delta = 0.05
-        params["viewbox"] = f"{lon - delta},{lat + delta},{lon + delta},{lat - delta}"
-        params["bounded"] = "0"
+        viewbox = f"{lon - delta},{lat + delta},{lon + delta},{lat - delta}"
+        # 1回目: 近傍に限定 / 2回目: 近傍を優先しつつ全国も許容
+        attempts = [("1", viewbox), ("0", viewbox)]
 
-    headers = {"User-Agent": "gps-buildings-info/0.1 (contact@example.com)"}
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+    for index, (bounded, viewbox) in enumerate(attempts):
+        params = dict(base_params)
+        if viewbox:
+            params["viewbox"] = viewbox
+            params["bounded"] = bounded
+        if index > 0:
+            # Nominatim の利用規約（1 req/秒）に合わせて待機する
+            time.sleep(1.0)
+
+        try:
+            resp = requests.get(url, params=params, headers=OSM_HEADERS, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"[Nominatim error] bounded={bounded} {e}", file=sys.stderr)
+            continue
+
         if not data:
-            return None
+            continue
+
+        if lat is not None and lon is not None:
+            result = _closest_nominatim_result(
+                data, lat, lon, NOMINATIM_MAX_DISTANCE_M
+            )
+            if result is not None:
+                return result
+            continue
+
         return data[0]
-    except Exception as e:
-        print(f"[Nominatim error] {e}", file=sys.stderr)
-        return None
+
+    return None
 
 
 # ==============================================================================
 # Overpass API による周辺 POI 検索・候補ランキング
 # ==============================================================================
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    # 予備エンドポイント（メインが 429/5xx/タイムアウトのときに使う）
+    "https://overpass.kumi.systems/api/interpreter",
+]
+# 後方互換（既存コード・テストからの参照用）
+OVERPASS_URL = OVERPASS_ENDPOINTS[0]
 OVERPASS_RADIUS_M = 500
+# Overpass は 30〜70 秒かかることがあるため、既定を 60 秒にする
+OVERPASS_TIMEOUT_SEC = int(os.getenv("OVERPASS_TIMEOUT_SEC", "60"))
+# Overpass QL 側の timeout は HTTP より少し短くして、サーバ側で打ち切らせる
+OVERPASS_QUERY_TIMEOUT = max(5, OVERPASS_TIMEOUT_SEC - 10)
 
 # 候補の osm_class として優先的に使う OSM キー
 OSM_CLASS_KEYS = (
@@ -249,23 +323,39 @@ def overpass_search(
     if not filters:
         return []
 
-    # クエリが大きくなりすぎないよう最大 4 タグまで
-    parts = []
-    for f in filters[:4]:
-        for element in ("node", "way", "relation"):
-            parts.append(f"{element}{f}(around:{int(radius)},{lat},{lon});")
+    # クエリが大きくなりすぎないよう最大 4 タグまで。
+    # nwr で node/way/relation をまとめて検索し、クエリのパーツ数を削減する。
+    parts = [
+        f"nwr{f}(around:{int(radius)},{lat},{lon});"
+        for f in filters[:4]
+    ]
+    query = (
+        f"[out:json][timeout:{OVERPASS_QUERY_TIMEOUT}];"
+        f"({''.join(parts)});out center tags;"
+    )
 
-    query = f"[out:json][timeout:20];({''.join(parts)});out center tags;"
-    headers = {"User-Agent": "gps-buildings-info/0.1 (contact@example.com)"}
-
-    try:
-        resp = requests.post(
-            OVERPASS_URL, data={"data": query}, headers=headers, timeout=25
-        )
-        resp.raise_for_status()
-        elements = resp.json().get("elements", [])
-    except Exception as e:
-        print(f"[Overpass error] {e}", file=sys.stderr)
+    elements = []
+    for endpoint in OVERPASS_ENDPOINTS:
+        started = time.perf_counter()
+        try:
+            resp = requests.post(
+                endpoint,
+                data={"data": query},
+                headers=OSM_HEADERS,
+                timeout=OVERPASS_TIMEOUT_SEC,
+            )
+            resp.raise_for_status()
+            elements = resp.json().get("elements", [])
+            break
+        except Exception as e:
+            elapsed = round(time.perf_counter() - started, 1)
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            print(
+                f"[Overpass error] endpoint={endpoint} elapsed={elapsed}s "
+                f"status={status} {e}",
+                file=sys.stderr,
+            )
+    else:
         return []
 
     candidates = []
@@ -404,6 +494,48 @@ def rank_candidates(
     return ranked
 
 
+# ==============================================================================
+# 段階別の計測ログ
+# ==============================================================================
+
+TIMINGS_LOG_DIR = os.getenv("TIMINGS_LOG_DIR") or os.path.join(
+    os.path.dirname(__file__), "logs"
+)
+
+
+class StageTimer:
+    """段階別の所要時間をミリ秒で記録する。"""
+
+    def __init__(self):
+        self.timings = {}
+        self._t = time.perf_counter()
+
+    def mark(self, name):
+        """直前の mark からの経過時間を ``timings[name]`` に記録する。"""
+        now = time.perf_counter()
+        self.timings[name] = round((now - self._t) * 1000)
+        self._t = now
+        return self.timings[name]
+
+
+def write_timings_log(record):
+    """
+    timings を JSONL ファイルに追記する。
+
+    Vercel など読み取り専用ファイルシステムでは失敗するが、
+    計測ログが原因でリクエストを落とさないよう警告だけ出す。
+    """
+    try:
+        os.makedirs(TIMINGS_LOG_DIR, exist_ok=True)
+        path = os.path.join(
+            TIMINGS_LOG_DIR, f"timings-{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+        )
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[timings log warning] {e}", file=sys.stderr)
+
+
 def build_geolocate_result(
     question: str,
     analysis: dict,
@@ -411,6 +543,7 @@ def build_geolocate_result(
     lon: Optional[float],
     facing: Optional[str] = None,
     top_results: Optional[list] = None,
+    timings=None,
 ):
     """
     解析結果と位置情報から、llm_qa に渡せる geolocate_result 形式の dict を構築する。
@@ -422,11 +555,15 @@ def build_geolocate_result(
     Overpass 検索に使うタグは `feature_tags.collect_search_tags` で
     `expanded_tags` / `mapfeatures.csv` の類似度結果 / `high_buildings.csv` を
     統合したものを用いる（詳細は同モジュールの docstring を参照）。
+
+    :param timings: `StageTimer` などの ``mark(name)`` を持つオブジェクト（任意）
     """
     resolved_entities = analysis.get("resolved_entities", [])
     expanded_tags = analysis.get("expanded_tags", [])
     feature_keywords = analysis.get("feature_keywords", [])
     search_tags = collect_search_tags(analysis, top_results=top_results)
+    if timings is not None:
+        timings.mark("tags")
 
     # 検索クエリの決定
     search_query = None
@@ -435,7 +572,8 @@ def build_geolocate_result(
     elif feature_keywords:
         search_query = " ".join(feature_keywords[:3])
     elif expanded_tags:
-        search_query = expanded_tags[0].replace("_", " ")
+        # class=value 形式の場合は値部分だけを使う
+        search_query = expanded_tags[0].split("=", 1)[-1].replace("_", " ")
 
     candidates = []
     found_target = None
@@ -443,6 +581,8 @@ def build_geolocate_result(
 
     if search_query:
         nominatim_result = nominatim_search(search_query, lat=lat, lon=lon)
+        if timings is not None:
+            timings.mark("nominatim")
         if nominatim_result:
             try:
                 target_lat = float(nominatim_result.get("lat", 0))
@@ -475,6 +615,8 @@ def build_geolocate_result(
     # Nominatim で見つからない場合は、現在地周辺を Overpass で検索する
     if found_target is None and lat is not None and lon is not None and search_tags:
         overpass_candidates = overpass_search(lat, lon, search_tags)
+        if timings is not None:
+            timings.mark("overpass")
         if overpass_candidates:
             candidates = rank_candidates(overpass_candidates, analysis, facing=facing)
             found_target = candidates[0]
@@ -527,6 +669,12 @@ def ask(request: AskRequest):
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="question が空です")
 
+    timer = StageTimer()
+    log_record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "question": request.question,
+    }
+
     try:
         analysis = analyze_and_search(
             request.question,
@@ -535,16 +683,25 @@ def ask(request: AskRequest):
             top_k=5,
         )
     except Exception as e:
+        log_record.update(error=f"analysis: {e}", timings=timer.timings)
+        write_timings_log(log_record)
         raise HTTPException(status_code=500, detail=f"テキスト解析に失敗しました: {e}")
+    timer.mark("analysis")
 
-    geolocate_result = build_geolocate_result(
-        request.question,
-        analysis["analysis"],
-        lat=request.latitude,
-        lon=request.longitude,
-        facing=request.facing,
-        top_results=analysis.get("top_results"),
-    )
+    try:
+        geolocate_result = build_geolocate_result(
+            request.question,
+            analysis["analysis"],
+            lat=request.latitude,
+            lon=request.longitude,
+            facing=request.facing,
+            top_results=analysis.get("top_results"),
+            timings=timer,
+        )
+    except Exception as e:
+        log_record.update(error=f"geolocate: {e}", timings=timer.timings)
+        write_timings_log(log_record)
+        raise HTTPException(status_code=500, detail=f"位置検索に失敗しました: {e}")
 
     current_location = None
     if request.latitude is not None and request.longitude is not None:
@@ -557,13 +714,25 @@ def ask(request: AskRequest):
             current_location=current_location,
             facing=request.facing,
             generate_audio=request.generate_audio,
+            timings=timer,
         )
     except RuntimeError as e:
+        log_record.update(error=f"llm: {e}", timings=timer.timings)
+        write_timings_log(log_record)
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
+        log_record.update(error=f"llm: {e}", timings=timer.timings)
+        write_timings_log(log_record)
         raise HTTPException(status_code=500, detail=f"回答生成に失敗しました: {e}")
 
     audio_url = _to_audio_url(llm_result.get("audio_path"))
+
+    log_record.update(
+        status=geolocate_result.get("status"),
+        found_target=(geolocate_result.get("found_target") or {}).get("name"),
+        timings=timer.timings,
+    )
+    write_timings_log(log_record)
 
     return {
         "question": request.question,

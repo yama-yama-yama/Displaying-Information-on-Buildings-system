@@ -138,13 +138,16 @@ def test_ask_gemini_enables_google_search_grounding(monkeypatch):
             return FakeResponse()
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, http_options=None):
             captured["api_key"] = api_key
+            captured["http_options"] = http_options
             self.models = FakeModels()
 
     class FakeConfig:
-        def __init__(self, tools=None):
-            self.tools = tools
+        def __init__(self, **kwargs):
+            self.tools = kwargs.get("tools")
+            self.thinking_config = kwargs.get("thinking_config")
+            self.kwargs = kwargs
 
     class FakeTool:
         def __init__(self, google_search=None):
@@ -152,6 +155,19 @@ def test_ask_gemini_enables_google_search_grounding(monkeypatch):
 
     class FakeGoogleSearch:
         pass
+
+    class FakeHttpRetryOptions:
+        def __init__(self, attempts=None):
+            self.attempts = attempts
+
+    class FakeHttpOptions:
+        def __init__(self, timeout=None, retry_options=None):
+            self.timeout = timeout
+            self.retry_options = retry_options
+
+    class FakeThinkingConfig:
+        def __init__(self, thinking_budget=None):
+            self.thinking_budget = thinking_budget
 
     fake_google = types.ModuleType("google")
     fake_genai = types.ModuleType("google.genai")
@@ -162,6 +178,9 @@ def test_ask_gemini_enables_google_search_grounding(monkeypatch):
     fake_types.GenerateContentConfig = FakeConfig
     fake_types.Tool = FakeTool
     fake_types.GoogleSearch = FakeGoogleSearch
+    fake_types.HttpOptions = FakeHttpOptions
+    fake_types.HttpRetryOptions = FakeHttpRetryOptions
+    fake_types.ThinkingConfig = FakeThinkingConfig
 
     monkeypatch.setitem(sys.modules, "google", fake_google)
     monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
@@ -173,6 +192,11 @@ def test_ask_gemini_enables_google_search_grounding(monkeypatch):
     assert isinstance(captured["config"], FakeConfig)
     assert len(captured["config"].tools) == 1
     assert isinstance(captured["config"].tools[0].google_search, FakeGoogleSearch)
+    # タイムアウトとリトライが SDK に渡っていること
+    assert captured["http_options"].timeout == llm_qa.LLM_TIMEOUT_MS
+    assert captured["http_options"].retry_options.attempts == 2
+    # 既定では thinking_config を送らない（モデル非対応の 400 を避ける）
+    assert captured["config"].thinking_config is None
 
 
 def test_answer_question_builds_prompt_and_audio(monkeypatch):

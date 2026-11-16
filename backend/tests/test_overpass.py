@@ -77,8 +77,8 @@ def test_overpass_search_parses_nodes_and_ways(monkeypatch):
     candidates = main.overpass_search(35.6812, 139.7671, ["amenity=cafe", "building"])
 
     assert len(candidates) == 2
-    assert "node[\"amenity\"=\"cafe\"]" in captured["query"]
-    assert "way[\"building\"]" in captured["query"]
+    assert "nwr[\"amenity\"=\"cafe\"]" in captured["query"]
+    assert "nwr[\"building\"]" in captured["query"]
     assert "around:" in captured["query"]
 
     cafe_a, cafe_b = candidates
@@ -129,6 +129,63 @@ def test_overpass_search_handles_request_error(monkeypatch):
 
     monkeypatch.setattr(main.requests, "post", boom)
     assert main.overpass_search(35.0, 139.0, ["amenity=cafe"]) == []
+
+
+def test_overpass_timeout_from_env(monkeypatch):
+    captured = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        captured["timeout"] = timeout
+        return FakeResponse({"elements": []})
+
+    monkeypatch.setattr(main, "OVERPASS_TIMEOUT_SEC", 42)
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    main.overpass_search(35.0, 139.0, ["amenity=cafe"])
+    assert captured["timeout"] == 42
+
+
+def test_overpass_falls_back_to_secondary(monkeypatch):
+    calls = []
+    payload = {
+        "elements": [
+            {
+                "type": "node",
+                "lat": 35.0,
+                "lon": 139.0,
+                "tags": {"amenity": "cafe", "name": "予備で取得"},
+            }
+        ]
+    }
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            raise RuntimeError("503 Service Unavailable")
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    candidates = main.overpass_search(35.0, 139.0, ["amenity=cafe"])
+
+    assert len(calls) == 2
+    assert calls[0] == main.OVERPASS_ENDPOINTS[0]
+    assert calls[1] == main.OVERPASS_ENDPOINTS[1]
+    assert candidates[0]["name"] == "予備で取得"
+
+
+def test_overpass_uses_osm_headers(monkeypatch):
+    captured = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        captured["headers"] = headers
+        return FakeResponse({"elements": []})
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    main.overpass_search(35.0, 139.0, ["amenity=cafe"])
+
+    assert captured["headers"] == main.OSM_HEADERS
+    assert "example.com" not in captured["headers"]["User-Agent"]
 
 
 # ==============================================================================

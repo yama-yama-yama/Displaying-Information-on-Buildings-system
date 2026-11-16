@@ -11,6 +11,7 @@ export interface AnalyzeResponse {
     intent: IntentInfo
     resolved_entities: ResolvedEntity[]
     expanded_tags: string[]
+    expanded_keywords?: string[]
     feature_keywords: string[]
     translated_en: string
     tokens: string[]

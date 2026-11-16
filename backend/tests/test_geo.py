@@ -1,7 +1,21 @@
 # -*- coding: utf-8 -*-
 """座標計算ヘルパーと build_geolocate_result のテスト。"""
 
+import json
+import os
+
 import main
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self.payload
 
 
 # ==============================================================================
@@ -99,3 +113,35 @@ def test_build_geolocate_result_uses_feature_keywords(monkeypatch):
 
     main.build_geolocate_result("カフェはどこ？", analysis, lat=None, lon=None)
     assert captured["query"] == "カフェ 駅前"
+
+
+def test_build_geolocate_result_finds_sandome(monkeypatch):
+    """記録座標とドームのタグから、Overpass 経由でサンドーム福井を特定できる。"""
+    fixture_path = os.path.join(
+        os.path.dirname(__file__), "fixtures", "overpass_sandome.json"
+    )
+    with open(fixture_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    monkeypatch.setattr(main, "nominatim_search", lambda *a, **k: None)
+    monkeypatch.setattr(main.requests, "post", lambda *a, **k: FakeResponse(payload))
+
+    analysis = {
+        "resolved_entities": [],
+        "expanded_tags": ["leisure=stadium", "building=stadium"],
+        "feature_keywords": ["ドーム"],
+        "directions": [],
+    }
+
+    result = main.build_geolocate_result(
+        "前方のドームの大きさ",
+        analysis,
+        lat=35.93195159457257,
+        lon=136.184824593492,
+    )
+
+    assert result["status"] == "overpass_success"
+    target = result["found_target"]
+    assert target["name"] == "サンドーム福井"
+    assert 170 <= target["distance_meters"] <= 190
+

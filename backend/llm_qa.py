@@ -36,7 +36,10 @@ if sys.platform == 'win32':
 DEFAULT_API_KEY_PATH = os.path.join(os.path.dirname(__file__), "api_KEY.txt")
 # 後方互換のためモジュール読み込み時点の環境変数も保持する（実処理では load_gemini_api_key を使う）
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DEFAULT_MODEL = "gemini-3.8-flash"
+# 503 多発時の切り替え用に環境変数で上書きできる
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# Gemini のタイムアウト（ミリ秒）。HttpOptions.timeout はミリ秒指定。
+LLM_TIMEOUT_MS = int(os.getenv("LLM_TIMEOUT_MS", "60000"))
 
 # OpenAI 互換 API の既定値（OPENAI_BASE_URL / OPENAI_MODEL で上書き可能）
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -243,12 +246,30 @@ def ask_gemini(prompt, api_key=None, model=None, web_search=None):
         from google import genai
         from google.genai import types as genai_types
 
-        client = genai.Client(api_key=key)
-        config = None
+        # タイムアウトとリトライを明示する（未指定だと長時間待ち・即時失敗になる）
+        http_options = genai_types.HttpOptions(
+            timeout=LLM_TIMEOUT_MS,
+            retry_options=genai_types.HttpRetryOptions(attempts=2),
+        )
+        client = genai.Client(api_key=key, http_options=http_options)
+
+        config_kwargs = {}
         if use_web_search:
-            config = genai_types.GenerateContentConfig(
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
+            config_kwargs["tools"] = [
+                genai_types.Tool(google_search=genai_types.GoogleSearch())
+            ]
+        # thinking 非対応モデルでは 400 になるため、環境変数でオプトインする
+        thinking_budget = os.getenv("LLM_THINKING_BUDGET")
+        if thinking_budget:
+            config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_budget=int(thinking_budget)
             )
+
+        config = (
+            genai_types.GenerateContentConfig(**config_kwargs)
+            if config_kwargs
+            else None
+        )
         response = client.models.generate_content(
             model=model, contents=prompt, config=config
         )
@@ -644,21 +665,28 @@ def text_to_speech(text, output_path=None, lang="ja"):
 
 def answer_question(geolocate_result, question, current_location=None, facing=None,
                     api_key=None, model=None, web_search=None,
-                    generate_audio=False, audio_path=None):
+                    generate_audio=False, audio_path=None, timings=None):
     """
     geolocate_step_serch の結果と質問から LLM 回答を生成し、必要なら音声化する。
 
     LLM プロバイダは `ask_llm` が自動選択する（Gemini → OpenAI 互換の順）。
     `web_search` を省略した場合は環境変数 `LLM_WEB_SEARCH` に従う（既定: 有効）。
 
+    :param timings: ``mark(name)`` を持つ計測オブジェクト（任意）
     :return: dict {"answer": str, "audio_path": str|None, "prompt": str}
     """
     prompt = build_prompt(geolocate_result, question,
                           current_location=current_location, facing=facing)
     answer = ask_llm(prompt, api_key=api_key, model=model, web_search=web_search)
+    if timings is not None:
+        timings.mark("llm")
+
     saved_path = None
     if generate_audio and answer:
         saved_path = text_to_speech(answer, output_path=audio_path)
+        if timings is not None:
+            timings.mark("tts")
+
     return {
         "answer": answer,
         "audio_path": saved_path,

@@ -34,15 +34,6 @@ if sys.platform == 'win32':
 # 0. グローバル設定 & モデル遅延読み込み
 # ==============================================================================
 
-GEMINI_API_KEY = None
-api_key_file = os.path.join(os.path.dirname(__file__), "api_KEY.txt")
-if os.path.exists(api_key_file):
-    try:
-        with open(api_key_file, "r", encoding="utf-8") as f:
-            GEMINI_API_KEY = f.read().strip()
-    except Exception:
-        pass
-
 WORD2VEC_MODEL = None
 GINZA_NLP = None
 
@@ -451,38 +442,78 @@ SUFFIX_RULES = [
 ]
 
 
-def query_gemini_for_entity(entity_text):
-    """
-    未知の固有名詞や地物名について、Gemini API を用いて施設種別・OSMタグを推定する
-    """
-    if not GEMINI_API_KEY:
-        return None
+# 助詞（分割用）。長いものを先に置く。
+_PARTICLE_RE = re.compile(
+    r"(?:から|まで|より|って|など|だけ|の|は|が|を|に|で|へ|と|や|も)"
+)
 
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = (
-            f"施設名や地名: 「{entity_text}」について、これが表す施設の種類を英語の一般名詞およびOpenStreetMapのタグ（例: tower, cafe, fast_food, place_of_worship, stadium, museum, park, university, convenience など）で最大3つ、カンマ区切りで出力してください。\n"
-            f"出力例: tower, viewpoint, attraction"
-        )
-        res = model.generate_content(prompt)
-        if res.text:
-            tags = [t.strip().lower().replace(" ", "_") for t in res.text.strip().split(",") if t.strip()]
-            return tags
-    except Exception:
-        pass
-    return None
+# 地物ではない質問の属性語（タグ化・キーワード化しない）
+MEASURE_WORDS = {
+    "大きさ", "高さ", "広さ", "長さ", "距離", "名前", "場所", "位置",
+    "色", "形", "用途", "構造", "住所", "料金", "営業時間", "値段",
+    "何", "どこ", "いつ", "いくつ", "どれ", "くらい", "程度", "こと", "もの",
+}
+
+# 方向語・メタ語などの除外ストップワード
+JA_STOPWORDS = {
+    "前", "後ろ", "右", "左", "東", "西", "南", "北", "北東", "北西", "南東", "南西",
+    "右側", "左側", "前方", "後方", "正面", "目の前", "手前", "側", "方", "方角", "方向",
+    "何", "なん", "どこ", "どちら", "名前", "場所", "位置", "辺り", "近く", "周り", "隣",
+    "あれ", "これ", "それ", "あそこ", "ここ", "そこ", "やつ", "もの", "建物", "施設",
+}
+
+
+def split_ja_segments(text):
+    """
+    助詞で日本語文を区切り、ストップワード・属性語を除いた語のリストを返す。
+
+    GiNZA が利用できない場合の簡易キーワード抽出として使う。
+    カタカナの複合名（サンドーム福井など）は助詞を含まないため分割されない。
+    """
+    if not text:
+        return []
+
+    normalized = re.sub(r"[、。！？!?,.「」『』（）()\s]+", " ", text)
+    segments = []
+    for chunk in normalized.split():
+        for seg in _PARTICLE_RE.split(chunk):
+            seg = seg.strip()
+            if (
+                len(seg) >= 2
+                and seg not in JA_STOPWORDS
+                and seg not in MEASURE_WORDS
+            ):
+                segments.append(seg)
+    return segments
 
 
 def resolve_entities_and_keywords(text, doc=None):
     """
     入力テキストから方向詞・疑問詞を除去し、固有名詞や一般名詞を抽出して
-    対応するOSMタグ（expanded_tags）を推定・生成する
+    対応する OSM タグ（expanded_tags）を推定・生成する。
+
+    :return: dict
+        - ``resolved_entities``: 解決した固有名詞のリスト
+        - ``expanded_tags``: Overpass 用の ``class=value`` 形式タグ
+        - ``expanded_keywords``: 類似度計算用の値のみ（``stadium`` など）
+        - ``feature_keywords``: 翻訳・Nominatim 用の日本語キーワード
     """
     resolved_entities = []
     expanded_tags = []
+    expanded_keywords = []
     seen_tags = set()
+    seen_keywords = set()
+
+    def add_tag(cls, value, tags):
+        tag = f"{cls}={value}"
+        if tag not in seen_tags:
+            seen_tags.add(tag)
+            expanded_tags.append(tag)
+        for keyword in [value] + list(tags or []):
+            keyword = str(keyword).strip().lower()
+            if keyword and keyword not in seen_keywords:
+                seen_keywords.add(keyword)
+                expanded_keywords.append(keyword)
 
     # 1. 固有名詞辞書 (BUILTIN_ENTITY_MAP) の走査 (長い名前順)
     for entity_name, data in sorted(BUILTIN_ENTITY_MAP.items(), key=lambda x: -len(x[0])):
@@ -494,44 +525,30 @@ def resolve_entities_and_keywords(text, doc=None):
                 "value": data["value"],
                 "tags": data["tags"]
             })
-            for t in data["tags"]:
-                if t not in seen_tags:
-                    seen_tags.add(t)
-                    expanded_tags.append(t)
+            add_tag(data["class"], data["value"], data["tags"])
 
-    # 2. GiNZA または形態素トークンの抽出
+    # 2. GiNZA または簡易分割による語の抽出
     nouns = []
     propns = []
-
-    # 方向語・メタ語などの除外ストップワード
-    stopwords_ja = {
-        "前", "後ろ", "右", "左", "東", "西", "南", "北", "北東", "北西", "南東", "南西",
-        "右側", "左側", "前方", "後方", "正面", "目の前", "手前", "側", "方", "方角", "方向",
-        "何", "なん", "どこ", "どちら", "名前", "場所", "位置", "辺り", "近く", "周り", "隣",
-        "あれ", "これ", "それ", "あそこ", "ここ", "そこ", "やつ", "もの", "建物", "施設"
-    }
 
     if doc is not None:
         for token in doc:
             lemma = token.lemma_ if token.lemma_ else token.text
             if token.pos_ == "PROPN":
                 propns.append(token.text)
-                if lemma not in stopwords_ja:
+                if lemma not in JA_STOPWORDS and lemma not in MEASURE_WORDS:
                     nouns.append(lemma)
             elif token.pos_ == "NOUN":
-                if lemma not in stopwords_ja:
+                if lemma not in JA_STOPWORDS and lemma not in MEASURE_WORDS:
                     nouns.append(lemma)
     else:
-        # GiNZAがない場合の簡易抽出
-        tokens_raw = re.findall(r'[\u4e00-\u9faf\u3040-\u309f\u30a0-\u30ffA-Za-z0-9]+', text)
-        for t in tokens_raw:
-            if t not in stopwords_ja and len(t) >= 2:
-                nouns.append(t)
+        # GiNZAがない場合は助詞で区切って簡易抽出する
+        nouns = split_ja_segments(text)
 
-    # 3. 接尾辞ルール (SUFFIX_RULES) によるタグ推定
-    for word in nouns + propns + [text]:
+    # 3. 接尾辞ルール (SUFFIX_RULES) を分割後の語に適用する
+    for word in nouns + propns:
         for pat, cls, val, tags in SUFFIX_RULES:
-            if re.match(pat, word):
+            if re.search(pat, word):
                 resolved_entities.append({
                     "matched_name": word,
                     "source": "suffix_rule",
@@ -539,37 +556,21 @@ def resolve_entities_and_keywords(text, doc=None):
                     "value": val,
                     "tags": tags
                 })
-                for t in tags:
-                    if t not in seen_tags:
-                        seen_tags.add(t)
-                        expanded_tags.append(t)
+                add_tag(cls, val, tags)
                 break
 
-    # 4. 未知の固有名詞に対する Gemini API フォールバック
-    if not expanded_tags and GEMINI_API_KEY:
-        target_entity = propns[0] if propns else (nouns[0] if nouns else text)
-        gemini_tags = query_gemini_for_entity(target_entity)
-        if gemini_tags:
-            resolved_entities.append({
-                "matched_name": target_entity,
-                "source": "gemini_llm_inference",
-                "class": "inferred",
-                "value": gemini_tags[0],
-                "tags": gemini_tags
-            })
-            for t in gemini_tags:
-                if t not in seen_tags:
-                    seen_tags.add(t)
-                    expanded_tags.append(t)
-
     # 純粋な地物キーワード（英訳へ渡す用）
-    filtered_nouns = [n for n in nouns if n not in stopwords_ja]
+    filtered_nouns = [
+        n for n in nouns
+        if n not in JA_STOPWORDS and n not in MEASURE_WORDS
+    ]
     if not filtered_nouns and propns:
         filtered_nouns = propns
 
     return {
         "resolved_entities": resolved_entities,
         "expanded_tags": expanded_tags,
+        "expanded_keywords": expanded_keywords,
         "feature_keywords": filtered_nouns
     }
 
@@ -626,7 +627,7 @@ def translate_ja_to_en(text):
 
     Google翻訳API (GTX) を第1候補として試し、レート制限(429)やブロック(403)などで
     失敗した場合は、他のGoogleクライアントやMyMemoryなどの代替プロバイダに順次フォールバックする。
-    全て失敗した場合はGemini API、最後に入力文字列をそのまま返す。
+    全て失敗した場合は入力文字列をそのまま返す。
     """
     providers = [
         ("Google (gtx)", lambda: _translate_google(text, client="gtx")),
@@ -643,19 +644,6 @@ def translate_ja_to_en(text):
             except Exception as e:
                 print(f"google translate error ({name}): {type(e).__name__}", file=sys.stderr)
                 time.sleep(0.5)
-
-    # Gemini API が利用可能な場合のフォールバック
-    if GEMINI_API_KEY:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            prompt = f"Translate the following Japanese keyword or short phrase to English. Output only the translation: {text}"
-            res = model.generate_content(prompt)
-            if res.text:
-                return res.text.strip()
-        except Exception:
-            pass
 
     return text
 
@@ -726,9 +714,32 @@ def tokenize_and_normalize(text, additional_tags=None):
 # 5. 類似度計算エンジン (difflib / word2vec)
 # ==============================================================================
 
-def calculate_similarity_difflib(token_info_list, value, expanded_tags=None):
+# difflib の文字類似は誤マッチしやすいため、下限と重みを設ける
+# 例: dome/home = 0.75, size/site = 0.75 を除外する
+FUZZY_RATIO_MIN = 0.80
+FUZZY_WEIGHT = 0.60
+
+
+def _tag_values(tags):
+    """``class=value`` / 素の値の混在タグから値部分だけを取り出す。"""
+    values = []
+    for tag in tags or []:
+        tag = str(tag).strip().lower()
+        if "=" in tag:
+            tag = tag.split("=", 1)[1]
+        tag = tag.replace("-", "_")
+        if tag:
+            values.append(tag)
+    return values
+
+
+def calculate_similarity_difflib(token_info_list, value, expanded_tags=None,
+                                 expanded_keywords=None):
     """
     difflib.SequenceMatcher による文字列類似度計算 (推定タグ考慮版)
+
+    :param expanded_tags: ``class=value`` 形式の推定タグ（値部分のみ比較）
+    :param expanded_keywords: 値のみの推定キーワード（未指定なら expanded_tags から導出）
     """
     value_clean = value.lower()
     value_words = value_clean.replace('_', ' ').replace('-', ' ').split()
@@ -738,14 +749,16 @@ def calculate_similarity_difflib(token_info_list, value, expanded_tags=None):
     best_matched_token = ""
     best_detail = ""
 
+    tag_values = _tag_values(
+        expanded_keywords if expanded_keywords is not None else expanded_tags
+    )
+
     # 推定タグとの直接完全一致チェック (最優先)
-    if expanded_tags:
-        for tag in expanded_tags:
-            tag_clean = tag.lower().replace('-', '_')
-            if tag_clean == value_clean:
-                return 1.0, tag, f"固有名詞/カテゴリ推定タグ完全一致 ('{tag}')"
-            if tag_clean in value_words:
-                return 0.96, tag, f"推定タグ構成語一致 ('{tag}' in '{value_display}')"
+    for tag_clean in tag_values:
+        if tag_clean == value_clean:
+            return 1.0, tag_clean, f"固有名詞/カテゴリ推定タグ完全一致 ('{tag_clean}')"
+        if tag_clean in value_words:
+            return 0.96, tag_clean, f"推定タグ構成語一致 ('{tag_clean}' in '{value_display}')"
 
     for orig_token, lemma_token in token_info_list:
         scores = []
@@ -769,13 +782,18 @@ def calculate_similarity_difflib(token_info_list, value, expanded_tags=None):
             score = 0.80 * (len(value_clean) / len(lemma_token))
             scores.append((score, f"部分一致 ('{value_clean}' in '{lemma_token}')"))
 
-        # 4. difflib SequenceMatcher
+        # 4. difflib SequenceMatcher（下限未満は採用しない）
         sim_full = difflib.SequenceMatcher(None, lemma_token, value_clean).ratio()
-        scores.append((sim_full * 0.85, f"SequenceMatcher 類似度 ({sim_full:.2f})"))
+        if sim_full >= FUZZY_RATIO_MIN:
+            scores.append((sim_full * FUZZY_WEIGHT, f"SequenceMatcher 類似度 ({sim_full:.2f})"))
 
         for vw in value_words:
             sim_word = difflib.SequenceMatcher(None, lemma_token, vw).ratio()
-            scores.append((sim_word * 0.85, f"SequenceMatcher 単語類似度 ('{lemma_token}' vs '{vw}': {sim_word:.2f})"))
+            if sim_word >= FUZZY_RATIO_MIN:
+                scores.append((sim_word * FUZZY_WEIGHT, f"SequenceMatcher 単語類似度 ('{lemma_token}' vs '{vw}': {sim_word:.2f})"))
+
+        if not scores:
+            continue
 
         token_best_score, token_best_detail = max(scores, key=lambda x: x[0])
         if token_best_score > best_score:
@@ -786,7 +804,8 @@ def calculate_similarity_difflib(token_info_list, value, expanded_tags=None):
     return best_score, best_matched_token, best_detail
 
 
-def calculate_similarity_word2vec(token_info_list, value, model, expanded_tags=None):
+def calculate_similarity_word2vec(token_info_list, value, model, expanded_tags=None,
+                                  expanded_keywords=None):
     """
     Word2Vec によるベクトル類似度計算 (推定タグ考慮版)
     """
@@ -798,14 +817,16 @@ def calculate_similarity_word2vec(token_info_list, value, model, expanded_tags=N
     best_matched_token = ""
     best_detail = ""
 
+    tag_values = _tag_values(
+        expanded_keywords if expanded_keywords is not None else expanded_tags
+    )
+
     # 推定タグとの直接一致チェック
-    if expanded_tags:
-        for tag in expanded_tags:
-            tag_clean = tag.lower().replace('-', '_')
-            if tag_clean == value_clean:
-                return 1.0, tag, f"固有名詞/カテゴリ推定タグ完全一致 ('{tag}')"
-            if tag_clean in value_words:
-                return 0.96, tag, f"推定タグ構成語一致 ('{tag}' in '{value_display}')"
+    for tag_clean in tag_values:
+        if tag_clean == value_clean:
+            return 1.0, tag_clean, f"固有名詞/カテゴリ推定タグ完全一致 ('{tag_clean}')"
+        if tag_clean in value_words:
+            return 0.96, tag_clean, f"推定タグ構成語一致 ('{tag_clean}' in '{value_display}')"
 
     for orig_token, lemma_token in token_info_list:
         scores = []
@@ -882,6 +903,7 @@ def analyze_and_search(input_text, method='difflib', use_ginza=True, csv_path='m
     entity_result = resolve_entities_and_keywords(input_text, doc=doc)
     resolved_entities = entity_result["resolved_entities"]
     expanded_tags = entity_result["expanded_tags"]
+    expanded_keywords = entity_result.get("expanded_keywords", [])
     feature_keywords = entity_result["feature_keywords"]
 
     # 5. 英語への翻訳とトークン化
@@ -889,8 +911,8 @@ def analyze_and_search(input_text, method='difflib', use_ginza=True, csv_path='m
     target_translate_text = " ".join(feature_keywords) if feature_keywords else input_text
     translated_text = translate_ja_to_en(target_translate_text)
 
-    # トークン化（推定タグも統合）
-    tokens = tokenize_and_normalize(translated_text, additional_tags=expanded_tags)
+    # トークン化（推定タグの値も統合）
+    tokens = tokenize_and_normalize(translated_text, additional_tags=expanded_keywords)
 
     # 6. 類似度計算
     w2v_model = None
@@ -915,9 +937,15 @@ def analyze_and_search(input_text, method='difflib', use_ginza=True, csv_path='m
         seen.add((cls, val))
 
         if method == 'word2vec':
-            score, matched_token, detail = calculate_similarity_word2vec(tokens, val, w2v_model, expanded_tags=expanded_tags)
+            score, matched_token, detail = calculate_similarity_word2vec(
+                tokens, val, w2v_model,
+                expanded_tags=expanded_tags, expanded_keywords=expanded_keywords,
+            )
         else:
-            score, matched_token, detail = calculate_similarity_difflib(tokens, val, expanded_tags=expanded_tags)
+            score, matched_token, detail = calculate_similarity_difflib(
+                tokens, val,
+                expanded_tags=expanded_tags, expanded_keywords=expanded_keywords,
+            )
 
         results.append({
             'class': cls,
@@ -938,6 +966,7 @@ def analyze_and_search(input_text, method='difflib', use_ginza=True, csv_path='m
             "intent": intent_info,
             "resolved_entities": resolved_entities,
             "expanded_tags": expanded_tags,
+            "expanded_keywords": expanded_keywords,
             "feature_keywords": feature_keywords,
             "translated_en": translated_text,
             "tokens": [t[0] for t in tokens],

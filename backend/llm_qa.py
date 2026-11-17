@@ -36,8 +36,8 @@ if sys.platform == 'win32':
 DEFAULT_API_KEY_PATH = os.path.join(os.path.dirname(__file__), "api_KEY.txt")
 # 後方互換のためモジュール読み込み時点の環境変数も保持する（実処理では load_gemini_api_key を使う）
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# 503 多発時の切り替え用に環境変数で上書きできる
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# 軽量・高速な Flash-Lite を既定にする（503 多発時は GEMINI_MODEL で上書き可能）
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # Gemini のタイムアウト（ミリ秒）。HttpOptions.timeout はミリ秒指定。
 LLM_TIMEOUT_MS = int(os.getenv("LLM_TIMEOUT_MS", "60000"))
 

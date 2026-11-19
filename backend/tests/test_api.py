@@ -185,12 +185,13 @@ def test_ask_llm_only_empty_prompt_returns_400(client):
 
 
 def test_ask_llm_only_success(client, monkeypatch):
-    """共通ディスパッチャ（Gemini / OpenAI 互換の自動選択）をモックして正常系を検証する。"""
+    """共通ディスパッチャ（OpenAI 互換 / Gemini の自動選択）をモックして正常系を検証する。"""
     captured = {}
 
-    def fake_ask_llm(prompt, model=None):
-        captured["prompt"] = prompt
-        captured["model"] = model
+    def fake_ask_llm(prompt, model=None, provider=None, web_search=None):
+        captured.update(
+            prompt=prompt, model=model, provider=provider, web_search=web_search
+        )
         return "こんにちは！"
 
     monkeypatch.setattr(main, "ask_llm", fake_ask_llm)
@@ -199,7 +200,81 @@ def test_ask_llm_only_success(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"prompt": "こんにちは", "answer": "こんにちは！"}
-    assert captured == {"prompt": "こんにちは", "model": None}
+    assert captured == {
+        "prompt": "こんにちは",
+        "model": None,
+        "provider": None,
+        "web_search": None,
+    }
+
+
+def test_ask_llm_only_passes_provider_and_web_search(client, monkeypatch):
+    captured = {}
+
+    def fake_ask_llm(prompt, model=None, provider=None, web_search=None):
+        captured.update(
+            prompt=prompt, model=model, provider=provider, web_search=web_search
+        )
+        return "ok"
+
+    monkeypatch.setattr(main, "ask_llm", fake_ask_llm)
+
+    response = client.post(
+        "/api/ask-llm-only",
+        json={
+            "prompt": "こんにちは",
+            "model": "model-x",
+            "provider": "openai",
+            "web_search": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "prompt": "こんにちは",
+        "model": "model-x",
+        "provider": "openai",
+        "web_search": False,
+    }
+
+
+# ==============================================================================
+# /api/llm-info
+# ==============================================================================
+
+def test_llm_info_returns_selected_provider_without_key(client, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "model-x")
+
+    response = client.get("/api/llm-info")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "provider": "openai",
+        "model": "model-x",
+        "base_url": "http://x/v1",
+        "web_search": True,
+    }
+    assert "sk-secret" not in response.text
+
+
+def test_llm_info_returns_null_when_no_key(client, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "auto")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(main, "get_llm_info", lambda: {
+        "provider": None,
+        "model": None,
+        "base_url": None,
+        "web_search": True,
+    })
+
+    response = client.get("/api/llm-info")
+
+    assert response.status_code == 200
+    assert response.json()["provider"] is None
 
 
 # ==============================================================================

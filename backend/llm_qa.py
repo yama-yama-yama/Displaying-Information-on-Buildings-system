@@ -6,10 +6,14 @@ geolocate_step_serch.py の探索結果（建物名・座標・属性・周辺�
 ユーザーの質問文を受け取り、LLM で回答を生成する。
 必要に応じて gTTS で回答テキストを mp3 音声ファイルに変換する。
 
-LLM プロバイダは次の優先順位で自動選択する:
-1. 環境変数 `GEMINI_API_KEY`（または後方互換の `api_KEY.txt`）→ Gemini API
-2. 環境変数 `OPENAI_API_KEY` → OpenAI 互換 API
-   （`OPENAI_BASE_URL` / `OPENAI_MODEL` で接続先とモデルを指定可能）
+LLM プロバイダは `LLM_PROVIDER` で明示できる:
+- `openai` : OpenAI 互換 API（`OPENAI_API_KEY` 必須）
+- `gemini` : Gemini API（`GEMINI_API_KEY` または `api_KEY.txt`）
+- `auto`   : 未設定時の既定。OpenAI 互換 → Gemini の順で自動選択
+
+OpenAI 互換 API は `OPENAI_BASE_URL` / `OPENAI_MODEL` で接続先とモデルを
+指定できる（OpenAI / Azure OpenAI / Ollama / LM Studio / vLLM など）。
+`auto` で OpenAI 呼び出しに失敗した場合は Gemini にフォールバックする。
 
 Web 検索は既定で有効。OpenAI 互換 API では Responses API の
 `tools=[{"type": "web_search"}]` を使い、Gemini では Google Search
@@ -21,6 +25,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import uuid
 
 import requests
@@ -45,6 +50,9 @@ LLM_TIMEOUT_MS = int(os.getenv("LLM_TIMEOUT_MS", "60000"))
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_OPENAI_TIMEOUT = 60
+DEFAULT_OPENAI_MAX_RETRIES = 2
+# 再試行対象の HTTP ステータス（レート制限・一時的なサーバー障害）
+OPENAI_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 
 # Web 検索ツール。LLM_WEB_SEARCH=0/false/off で無効化できる。
 WEB_SEARCH_TOOL = {"type": "web_search"}
@@ -126,6 +134,41 @@ def load_openai_config():
     }
 
 
+def openai_timeout_seconds():
+    """OpenAI 互換 API のタイムアウト（秒）。`OPENAI_TIMEOUT` で上書きできる。"""
+    raw = os.getenv("OPENAI_TIMEOUT")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return float(DEFAULT_OPENAI_TIMEOUT)
+
+
+def openai_max_retries():
+    """OpenAI 互換 API の最大再試行回数。`OPENAI_MAX_RETRIES` で上書きできる。"""
+    raw = os.getenv("OPENAI_MAX_RETRIES")
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return DEFAULT_OPENAI_MAX_RETRIES
+
+
+def openai_retry_backoff_seconds():
+    """再試行の初回待機秒。`OPENAI_RETRY_BACKOFF_SEC` で上書きできる。"""
+    raw = os.getenv("OPENAI_RETRY_BACKOFF_SEC")
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 1.0
+
+
 def web_search_enabled():
     """
     Web 検索ツールを使うかどうか。
@@ -139,25 +182,72 @@ def web_search_enabled():
     return value.strip().lower() not in ("0", "false", "off", "no")
 
 
-def detect_provider(path=DEFAULT_API_KEY_PATH):
-    """
-    使用する LLM プロバイダを判定する。
-
-    優先順位:
-    1. `GEMINI_API_KEY` が設定されていれば "gemini"
-    2. `OPENAI_API_KEY` が設定されていれば "openai"
-    3. `api_KEY.txt` が存在すれば後方互換として "gemini"
-
-    :return: "gemini" / "openai" / None
-    """
-    env_gemini = os.getenv("GEMINI_API_KEY")
-    if env_gemini and env_gemini.strip():
-        return "gemini"
+def _detect_auto_provider(path=DEFAULT_API_KEY_PATH):
+    """`auto` の自動選択。OpenAI 互換を優先し、無ければ Gemini。"""
     if load_openai_config():
         return "openai"
     if load_gemini_api_key(path):
         return "gemini"
     return None
+
+
+def detect_provider(path=DEFAULT_API_KEY_PATH):
+    """
+    使用する LLM プロバイダを判定する。
+
+    `LLM_PROVIDER` の値:
+    - `openai`: OpenAI 互換（`OPENAI_API_KEY` が必要）
+    - `gemini`: Gemini（`GEMINI_API_KEY` または api_KEY.txt が必要）
+    - `auto` / 未設定: OpenAI 互換 → Gemini の順で自動選択
+
+    明示したプロバイダのキーが無い場合は None を返す（別プロバイダへは
+    切り替えない）。`auto` だけがフォールバックする。
+
+    :return: "openai" / "gemini" / None
+    """
+    explicit = (os.getenv("LLM_PROVIDER") or "auto").strip().lower()
+    if explicit == "openai":
+        return "openai" if load_openai_config() else None
+    if explicit == "gemini":
+        return "gemini" if load_gemini_api_key(path) else None
+    if explicit not in ("", "auto"):
+        print(
+            f"[LLM warning] 不明な LLM_PROVIDER={explicit!r} のため auto を使用します",
+            file=sys.stderr,
+        )
+    return _detect_auto_provider(path)
+
+
+def get_llm_info(path=DEFAULT_API_KEY_PATH):
+    """
+    現在選択されている LLM の設定を返す（API キーは含めない）。
+
+    `/api/llm-info` と起動ログで使用する。
+    """
+    provider = detect_provider(path)
+    web_search = web_search_enabled()
+
+    if provider == "openai":
+        config = load_openai_config() or {}
+        return {
+            "provider": "openai",
+            "model": config.get("model"),
+            "base_url": config.get("base_url"),
+            "web_search": web_search,
+        }
+    if provider == "gemini":
+        return {
+            "provider": "gemini",
+            "model": DEFAULT_MODEL,
+            "base_url": "https://generativelanguage.googleapis.com",
+            "web_search": web_search,
+        }
+    return {
+        "provider": None,
+        "model": None,
+        "base_url": None,
+        "web_search": web_search,
+    }
 
 
 def build_prompt(geolocate_result, question, current_location=None, facing=None):
@@ -318,24 +408,50 @@ def _openai_headers(key):
 
 
 def _post_openai_json(endpoint, payload, key, timeout):
-    """OpenAI 互換 API に JSON を POST し、レスポンス JSON を返す。"""
-    try:
-        response = requests.post(
-            endpoint, json=payload, headers=_openai_headers(key), timeout=timeout
-        )
-    except Exception as e:
-        raise RuntimeError(f"OpenAI 互換 API 呼び出しに失敗しました: {e}")
+    """
+    OpenAI 互換 API に JSON を POST し、レスポンス JSON を返す。
 
-    if response.status_code >= 400:
-        detail = (response.text or "")[:500]
-        raise OpenAIApiError(
-            f"HTTP {response.status_code}: {detail}", response.status_code
-        )
+    429 / 500 / 502 / 503 / 504 と通信エラーは指数バックオフで再試行する。
+    再試行回数は `OPENAI_MAX_RETRIES`、初回待機は
+    `OPENAI_RETRY_BACKOFF_SEC` で調整できる。
+    """
+    max_retries = openai_max_retries()
+    backoff = openai_retry_backoff_seconds()
+    last_error = None
 
-    try:
-        return response.json()
-    except Exception as e:
-        raise RuntimeError(f"OpenAI 互換 API のレスポンス解析に失敗しました: {e}")
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(
+                endpoint, json=payload, headers=_openai_headers(key), timeout=timeout
+            )
+        except requests.RequestException as e:
+            last_error = RuntimeError(f"OpenAI 互換 API 呼び出しに失敗しました: {e}")
+            if attempt < max_retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise last_error
+
+        if response.status_code in OPENAI_RETRY_STATUS_CODES and attempt < max_retries:
+            print(
+                f"[OpenAI] HTTP {response.status_code} のため再試行します "
+                f"({attempt + 1}/{max_retries})",
+                file=sys.stderr,
+            )
+            time.sleep(backoff * (2 ** attempt))
+            continue
+
+        if response.status_code >= 400:
+            detail = (response.text or "")[:500]
+            raise OpenAIApiError(
+                f"HTTP {response.status_code}: {detail}", response.status_code
+            )
+
+        try:
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"OpenAI 互換 API のレスポンス解析に失敗しました: {e}")
+
+    raise last_error or RuntimeError("OpenAI 互換 API 呼び出しに失敗しました")
 
 
 def _extract_chat_text(data):
@@ -422,11 +538,12 @@ def _ask_openai_chat(prompt, key, base_url, model, timeout, web_search):
 
 
 def ask_openai(prompt, api_key=None, base_url=None, model=None,
-               timeout=DEFAULT_OPENAI_TIMEOUT, web_search=None):
+               timeout=None, web_search=None):
     """
     OpenAI 互換 API（OpenAI / Azure OpenAI / Ollama / LM Studio / vLLM など）に
     プロンプトを送信し、回答テキストを返す。
 
+    タイムアウトは `OPENAI_TIMEOUT`（秒、既定60）に従う。
     Web 検索が有効（既定）の場合は、まず Responses API に
     `tools=[{"type": "web_search"}]` を付けて問い合わせる。Responses API 非対応の
     サーバーでは chat/completions にフォールバックする。
@@ -443,6 +560,7 @@ def ask_openai(prompt, api_key=None, base_url=None, model=None,
     base_url = base_url or config.get("base_url")
     model = model or config.get("model") or DEFAULT_OPENAI_MODEL
     use_web_search = web_search_enabled() if web_search is None else web_search
+    timeout = openai_timeout_seconds() if timeout is None else timeout
 
     if use_web_search and _responses_supported is not False:
         try:
@@ -450,8 +568,11 @@ def ask_openai(prompt, api_key=None, base_url=None, model=None,
             _responses_supported = True
             return answer
         except OpenAIApiError as e:
-            if e.status_code in (400, 404, 405, 422):
-                _responses_supported = False
+            if e.status_code not in (400, 404, 405, 422):
+                # 429 / 5xx は再試行済み。auto 側で Gemini にフォールバックできるよう
+                # ここでは握りつぶさず、そのまま送出する。
+                raise
+            _responses_supported = False
             print(
                 "[OpenAI] responses API を利用できないため chat/completions に切り替えます: "
                 f"{e}",
@@ -467,9 +588,14 @@ def ask_openai(prompt, api_key=None, base_url=None, model=None,
     return _ask_openai_chat(prompt, key, base_url, model, timeout, use_web_search)
 
 
-def ask_llm(prompt, api_key=None, model=None, web_search=None):
+def ask_llm(prompt, api_key=None, model=None, web_search=None, provider=None):
     """
-    利用可能なプロバイダ（Gemini / OpenAI 互換）を自動選択して回答を生成する。
+    利用可能なプロバイダ（OpenAI 互換 / Gemini）を選択して回答を生成する。
+
+    `provider` は "openai" / "gemini" / "auto"。未指定時は `LLM_PROVIDER`
+    （未設定なら auto）に従う。`auto` は OpenAI 互換を優先し、失敗時に
+    Gemini へフォールバックする。明示指定（openai / gemini）では
+    フォールバックせず、設定不足・呼び出し失敗をそのまま返す。
 
     `api_key` が明示された場合は従来どおり Gemini のキーとして扱う。
     `web_search` を省略した場合は環境変数 `LLM_WEB_SEARCH` に従う（既定: 有効）。
@@ -477,23 +603,60 @@ def ask_llm(prompt, api_key=None, model=None, web_search=None):
     if api_key:
         return ask_gemini(prompt, api_key=api_key, model=model, web_search=web_search)
 
-    provider = detect_provider()
-    if provider == "gemini":
+    requested = (
+        provider if provider is not None else os.getenv("LLM_PROVIDER") or "auto"
+    ).strip().lower()
+    if requested not in ("auto", "openai", "gemini"):
+        print(
+            f"[LLM warning] 不明な provider={requested!r} のため auto を使用します",
+            file=sys.stderr,
+        )
+        requested = "auto"
+
+    if requested == "openai":
+        if not load_openai_config():
+            raise RuntimeError(
+                "OpenAI 互換 API キーが見つかりません。環境変数 OPENAI_API_KEY を設定してください。"
+            )
+        selected = "openai"
+    elif requested == "gemini":
+        if not load_gemini_api_key():
+            raise RuntimeError(
+                "Gemini API キーが見つかりません。環境変数 GEMINI_API_KEY を設定するか、"
+                f"{DEFAULT_API_KEY_PATH} を用意してください。"
+            )
+        selected = "gemini"
+    else:
+        selected = detect_provider()
+
+    if selected == "gemini":
         return ask_gemini(prompt, model=model, web_search=web_search)
 
-    if provider == "openai":
+    if selected == "openai":
         config = load_openai_config() or {}
-        return ask_openai(
-            prompt,
-            api_key=config.get("api_key"),
-            base_url=config.get("base_url"),
-            model=model or config.get("model"),
-            web_search=web_search,
-        )
+        try:
+            return ask_openai(
+                prompt,
+                api_key=config.get("api_key"),
+                base_url=config.get("base_url"),
+                model=model or config.get("model"),
+                web_search=web_search,
+            )
+        except RuntimeError as e:
+            # auto のときだけ Gemini にフォールバックする。
+            # 明示指定（LLM_PROVIDER=openai / provider="openai"）は失敗を隠さない。
+            if requested == "auto" and load_gemini_api_key():
+                print(
+                    "[LLM] OpenAI 互換 API に失敗したため Gemini にフォールバックします: "
+                    f"{e}",
+                    file=sys.stderr,
+                )
+                return ask_gemini(prompt, model=model, web_search=web_search)
+            raise
 
     raise RuntimeError(
-        "LLM API キーが見つかりません。環境変数 GEMINI_API_KEY または "
-        "OPENAI_API_KEY を設定してください。"
+        "LLM API キーが見つかりません。環境変数 OPENAI_API_KEY または "
+        "GEMINI_API_KEY を設定してください。"
     )
 
 

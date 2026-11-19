@@ -38,6 +38,7 @@ from llm_qa import (
     ask_llm,
     blob_storage_enabled,
     get_audio_from_blob,
+    get_llm_info,
     text_to_speech,
 )
 from searchsynonyms_mapfeatures_v2 import analyze_and_search
@@ -55,7 +56,7 @@ HTTP_USER_AGENT = os.getenv(
 )
 OSM_HEADERS = {"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"}
 
-app = FastAPI(title="屋外ナビアシスタント API", version="0.1.3")
+app = FastAPI(title="屋外ナビアシスタント API", version="0.1.5")
 
 # CORS: 開発中はフロントエンド開発サーバーからのリクエストを許可
 app.add_middleware(
@@ -65,6 +66,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def log_llm_config():
+    """選択中の LLM 設定を起動ログに出す（API キーは出さない）。"""
+    info = get_llm_info()
+    print(
+        "[LLM] provider={provider} model={model} base_url={base_url} "
+        "web_search={web_search}".format(**info),
+        file=sys.stderr,
+    )
+
+    requested = (os.getenv("LLM_PROVIDER") or "auto").strip().lower()
+    if requested in ("openai", "gemini") and info["provider"] != requested:
+        print(
+            f"[LLM warning] LLM_PROVIDER={requested} ですが、"
+            "必要な API キーが設定されていません",
+            file=sys.stderr,
+        )
 
 
 # ==============================================================================
@@ -121,6 +141,13 @@ class AskResponse(BaseModel):
     audio_path: Optional[str]
     analysis: dict
     found_target: Optional[dict]
+
+
+class LlmInfoResponse(BaseModel):
+    provider: Optional[str]
+    model: Optional[str]
+    base_url: Optional[str]
+    web_search: bool
 
 
 # ==============================================================================
@@ -641,6 +668,12 @@ def health_check():
     return {"status": "ok"}
 
 
+@app.get("/api/llm-info", response_model=LlmInfoResponse)
+def llm_info():
+    """現在選択されている LLM プロバイダの設定を返す（API キーは含めない）。"""
+    return get_llm_info()
+
+
 @app.post("/api/analyze", response_model=AnalyzeResponse)
 def analyze_text(request: AnalyzeRequest):
     """
@@ -864,6 +897,12 @@ def get_audio(filename: str):
 class LlmOnlyRequest(BaseModel):
     prompt: str = Field(..., description="LLM に送信するプロンプト")
     model: Optional[str] = Field(None, description="使用するモデル名（未指定時はプロバイダの既定値）")
+    provider: Optional[str] = Field(
+        None, description="使用するプロバイダ (openai / gemini / auto)"
+    )
+    web_search: Optional[bool] = Field(
+        None, description="Web 検索を有効にするか（未指定時は LLM_WEB_SEARCH）"
+    )
 
 
 class LlmOnlyResponse(BaseModel):
@@ -876,13 +915,19 @@ def ask_llm_only(request: LlmOnlyRequest):
     """
     プロンプトをそのまま LLM に送信し、回答のみを返す（ジオコーディングなし）。
 
-    プロバイダは `GEMINI_API_KEY` → `OPENAI_API_KEY` の順で自動選択される。
+    プロバイダは `LLM_PROVIDER`（既定 auto = OpenAI 互換優先）に従う。
+    リクエストの `provider` / `web_search` で一時的に上書きできる。
     """
     if not request.prompt or not request.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt が空です")
 
     try:
-        answer = ask_llm(request.prompt, model=request.model)
+        answer = ask_llm(
+            request.prompt,
+            model=request.model,
+            provider=request.provider,
+            web_search=request.web_search,
+        )
         return {"prompt": request.prompt, "answer": answer}
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))

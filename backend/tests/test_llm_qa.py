@@ -13,6 +13,19 @@ import pytest
 import llm_qa
 
 
+@pytest.fixture(autouse=True)
+def _clear_llm_env(monkeypatch):
+    """テスト間でプロバイダ設定が漏れないようにする。"""
+    for name in (
+        "LLM_PROVIDER",
+        "LLM_WEB_SEARCH",
+        "OPENAI_TIMEOUT",
+        "OPENAI_MAX_RETRIES",
+        "OPENAI_RETRY_BACKOFF_SEC",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 # ==============================================================================
 # build_prompt: geolocate_result のキー参照
 # ==============================================================================
@@ -762,11 +775,36 @@ def test_ask_openai_malformed_response_raises(monkeypatch):
 # detect_provider / ask_llm
 # ==============================================================================
 
-def test_detect_provider_prefers_gemini_env(monkeypatch, tmp_path):
+def test_detect_provider_auto_prefers_openai(monkeypatch, tmp_path):
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+
+    assert llm_qa.detect_provider(path=str(tmp_path / "missing.txt")) == "openai"
+
+
+def test_detect_provider_explicit_openai(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+
+    assert llm_qa.detect_provider(path=str(tmp_path / "missing.txt")) == "openai"
+
+
+def test_detect_provider_explicit_gemini(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
 
     assert llm_qa.detect_provider(path=str(tmp_path / "missing.txt")) == "gemini"
+
+
+def test_detect_provider_explicit_openai_without_key_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+
+    # 明示指定では別プロバイダに切り替えない
+    assert llm_qa.detect_provider(path=str(tmp_path / "missing.txt")) is None
 
 
 def test_detect_provider_uses_openai_without_gemini(monkeypatch, tmp_path):
@@ -790,6 +828,48 @@ def test_detect_provider_returns_none(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     assert llm_qa.detect_provider(path=str(tmp_path / "missing.txt")) is None
+
+
+def test_get_llm_info_openai(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "model-x")
+
+    info = llm_qa.get_llm_info(path=str(tmp_path / "missing.txt"))
+
+    assert info == {
+        "provider": "openai",
+        "model": "model-x",
+        "base_url": "http://x/v1",
+        "web_search": True,
+    }
+    assert "sk-secret" not in str(info)
+
+
+def test_get_llm_info_gemini(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+
+    info = llm_qa.get_llm_info(path=str(tmp_path / "missing.txt"))
+
+    assert info["provider"] == "gemini"
+    assert info["model"] == llm_qa.DEFAULT_MODEL
+    assert info["base_url"] == "https://generativelanguage.googleapis.com"
+
+
+def test_get_llm_info_none(monkeypatch, tmp_path):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    info = llm_qa.get_llm_info(path=str(tmp_path / "missing.txt"))
+
+    assert info == {
+        "provider": None,
+        "model": None,
+        "base_url": None,
+        "web_search": True,
+    }
 
 
 def test_ask_llm_dispatches_to_gemini(monkeypatch):
@@ -876,3 +956,138 @@ def test_ask_llm_explicit_api_key_uses_gemini(monkeypatch):
     )
 
     assert llm_qa.ask_llm("hello", api_key="explicit") == "gemini:explicit"
+
+
+def test_ask_llm_auto_falls_back_to_gemini(monkeypatch):
+    monkeypatch.setattr(llm_qa, "detect_provider", lambda *a, **k: "openai")
+    monkeypatch.setattr(
+        llm_qa,
+        "load_openai_config",
+        lambda: {"api_key": "k", "base_url": "http://x/v1", "model": "llama"},
+    )
+    monkeypatch.setattr(llm_qa, "load_gemini_api_key", lambda *a, **k: "gemini-key")
+    monkeypatch.setattr(
+        llm_qa,
+        "ask_openai",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("openai down")),
+    )
+    monkeypatch.setattr(
+        llm_qa,
+        "ask_gemini",
+        lambda prompt, api_key=None, model=None, web_search=None: "gemini-answer",
+    )
+
+    assert llm_qa.ask_llm("hello") == "gemini-answer"
+
+
+def test_ask_llm_explicit_openai_does_not_fall_back(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setattr(
+        llm_qa,
+        "load_openai_config",
+        lambda: {"api_key": "k", "base_url": "http://x/v1", "model": "llama"},
+    )
+    monkeypatch.setattr(
+        llm_qa,
+        "ask_openai",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("openai down")),
+    )
+
+    def fail_gemini(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("明示指定では Gemini にフォールバックしない")
+
+    monkeypatch.setattr(llm_qa, "ask_gemini", fail_gemini)
+
+    with pytest.raises(RuntimeError, match="openai down"):
+        llm_qa.ask_llm("hello")
+
+
+def test_ask_llm_provider_argument_overrides_env(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(
+        llm_qa,
+        "load_openai_config",
+        lambda: {"api_key": "k", "base_url": "http://x/v1", "model": "llama"},
+    )
+    monkeypatch.setattr(
+        llm_qa,
+        "ask_openai",
+        lambda prompt, api_key=None, base_url=None, model=None, web_search=None: "openai-answer",
+    )
+
+    assert llm_qa.ask_llm("hello", provider="openai") == "openai-answer"
+
+
+def test_ask_openai_timeout_from_env(monkeypatch):
+    _reset_responses_support(monkeypatch)
+    monkeypatch.setenv("OPENAI_TIMEOUT", "12")
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["timeout"] = timeout
+        return FakeHttpResponse(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(llm_qa.requests, "post", fake_post)
+
+    assert (
+        llm_qa.ask_openai(
+            "hello",
+            api_key="sk-test",
+            base_url="http://x/v1",
+            model="m",
+            web_search=False,
+        )
+        == "ok"
+    )
+    assert captured["timeout"] == 12.0
+
+
+def test_ask_openai_retries_on_503(monkeypatch):
+    _reset_responses_support(monkeypatch)
+    monkeypatch.setenv("OPENAI_MAX_RETRIES", "2")
+    monkeypatch.setenv("OPENAI_RETRY_BACKOFF_SEC", "0")
+    calls = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            return FakeHttpResponse(503, {}, "unavailable")
+        return FakeHttpResponse(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(llm_qa.requests, "post", fake_post)
+
+    assert (
+        llm_qa.ask_openai(
+            "hello",
+            api_key="sk-test",
+            base_url="http://x/v1",
+            model="m",
+            web_search=False,
+        )
+        == "ok"
+    )
+    assert len(calls) == 2
+
+
+def test_ask_openai_retries_exhausted_raises(monkeypatch):
+    _reset_responses_support(monkeypatch)
+    monkeypatch.setenv("OPENAI_MAX_RETRIES", "2")
+    monkeypatch.setenv("OPENAI_RETRY_BACKOFF_SEC", "0")
+    calls = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls.append(url)
+        return FakeHttpResponse(503, {}, "unavailable")
+
+    monkeypatch.setattr(llm_qa.requests, "post", fake_post)
+
+    with pytest.raises(RuntimeError, match="503"):
+        llm_qa.ask_openai(
+            "hello",
+            api_key="sk-test",
+            base_url="http://x/v1",
+            model="m",
+            web_search=False,
+        )
+
+    assert len(calls) == 3

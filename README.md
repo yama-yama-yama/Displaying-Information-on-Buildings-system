@@ -11,7 +11,7 @@
 ```
 backend/
   main.py                       FastAPI エントリポイント
-  llm_qa.py                     LLM 連携（Gemini / OpenAI 互換）・プロンプト構築・gTTS 音声生成
+  llm_qa.py                     LLM 連携（OpenAI 互換 / Gemini）・プロンプト構築・gTTS 音声生成
   searchsynonyms_mapfeatures_v2.py  自然文解析・OSM タグ推定
   feature_tags.py               ローカル CSV と解析結果のタグマージ
   transcribe.py                 音声文字起こし（/api/transcribe 用）
@@ -40,43 +40,53 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Gemini API キーは次のいずれかで設定してください（環境変数が優先されます）。
+### LLM プロバイダの設定
 
-1. 環境変数
+既定では **OpenAI 互換 API を優先**します。`LLM_PROVIDER` で明示できます。
 
-   ```bash
-   # Windows (PowerShell)
-   $env:GEMINI_API_KEY = "your-api-key"
-   # macOS / Linux
-   export GEMINI_API_KEY="your-api-key"
-   ```
+| 値 | 動作 |
+| --- | --- |
+| `openai` | OpenAI 互換 API を使用（`OPENAI_API_KEY` 必須） |
+| `gemini` | Gemini API を使用（`GEMINI_API_KEY` または `backend/api_KEY.txt`） |
+| `auto` / 未設定 | OpenAI 互換 → Gemini の順で自動選択 |
 
-2. `backend/api_KEY.txt` にキーを 1 行で保存する
-
-#### OpenAI 互換 API を使う場合
-
-`GEMINI_API_KEY` が未設定で `OPENAI_API_KEY` が設定されている場合は、
-OpenAI 互換 API（OpenAI / Azure OpenAI / Ollama / LM Studio / vLLM など）を使用します。
+#### OpenAI 互換 API（既定）
 
 ```bash
 # Windows (PowerShell)
 $env:OPENAI_API_KEY = "your-api-key"
-$env:OPENAI_BASE_URL = "http://localhost:11434/v1"  # 省略時: https://api.openai.com/v1
-$env:OPENAI_MODEL = "llama3"                         # 省略時: gpt-4o-mini
+$env:OPENAI_BASE_URL = "https://api.openai.com/v1"  # ゲートウェイに合わせて変更
+$env:OPENAI_MODEL = "gpt-4o-mini"
+$env:LLM_PROVIDER = "openai"                        # 省略時は auto（OpenAI 優先）
 
 # macOS / Linux
 export OPENAI_API_KEY="your-api-key"
-export OPENAI_BASE_URL="http://localhost:11434/v1"
-export OPENAI_MODEL="llama3"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_MODEL="gpt-4o-mini"
+export LLM_PROVIDER="openai"
 ```
 
-プロバイダの優先順位は次のとおりです。
+- `OPENAI_BASE_URL` は `/v1` まで含めて指定してください。`OPENAI_API_BASE` も別名として使えます。
+- Azure OpenAI / Ollama / LM Studio / vLLM も、それぞれのベース URL とモデル名を設定すれば使えます。
+- `OPENAI_TIMEOUT`（秒、既定 60）、`OPENAI_MAX_RETRIES`（既定 2）、
+  `OPENAI_RETRY_BACKOFF_SEC`（既定 1.0）でタイムアウトと再試行を調整できます。
+- `auto` で OpenAI 呼び出しに失敗した場合は、Gemini のキーがあれば Gemini にフォールバックします。
+  `LLM_PROVIDER=openai` の場合はフォールバックしません。
 
-1. `GEMINI_API_KEY`（環境変数）→ Gemini API
-2. `OPENAI_API_KEY`（環境変数）→ OpenAI 互換 API
-3. `backend/api_KEY.txt` → 後方互換として Gemini API
+#### Gemini API（フォールバック）
 
-`OPENAI_BASE_URL` は `/v1` まで含めて指定してください。`OPENAI_API_BASE` も別名として使えます。
+```bash
+# Windows (PowerShell)
+$env:GEMINI_API_KEY = "your-api-key"
+$env:LLM_PROVIDER = "gemini"
+
+# macOS / Linux
+export GEMINI_API_KEY="your-api-key"
+export LLM_PROVIDER="gemini"
+```
+
+`backend/api_KEY.txt` にキーを 1 行で保存する方法も使えます。
+モデルは `GEMINI_MODEL`（既定: `gemini-3.5-flash-lite`）で変更できます。
 
 #### Web 検索ツール
 
@@ -88,6 +98,8 @@ export OPENAI_MODEL="llama3"
 - **Gemini API**: Google Search グラウンディングを使用します。
 
 無効化する場合は `LLM_WEB_SEARCH=0` を設定してください。
+`/api/llm-info` で、現在選択されている provider / model / base_url と
+Web 検索の有効状態を確認できます（API キーは返しません）。
 
 起動:
 
@@ -139,9 +151,10 @@ Vercel Blob から取得してストリーミング配信します。フロン�
 | メソッド | パス | 説明 |
 | --- | --- | --- |
 | GET | `/api/health` | ヘルスチェック |
+| GET | `/api/llm-info` | 選択中の LLM プロバイダ・モデル・ベース URL・Web 検索設定（キーは含まない） |
 | POST | `/api/analyze` | 自然文の解析（方向・意図・固有名詞・OSM タグ候補） |
 | POST | `/api/ask` | 質問と現在地から建物を特定し、LLM が案内回答を生成 |
-| POST | `/api/ask-llm-only` | プロンプトをそのまま LLM（Gemini / OpenAI 互換を自動選択）に送信 |
+| POST | `/api/ask-llm-only` | プロンプトをそのまま LLM（OpenAI 互換 / Gemini を自動選択）に送信 |
 | POST | `/api/transcribe` | 音声ファイルを文字起こし（multipart: `file`） |
 | POST | `/api/tts` | テキストを gTTS で音声 (mp3) に変換し、再生用パスを返す |
 | GET | `/api/audio/{filename}` | 生成された回答音声 (mp3) を配信 |
@@ -221,10 +234,16 @@ npm run type-check
 
 | 変数 | 場所 | 説明 |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | バックエンド | Gemini API キー（最優先） |
-| `OPENAI_API_KEY` | バックエンド | OpenAI 互換 API キー（Gemini キーが無い場合に使用） |
+| `LLM_PROVIDER` | バックエンド | `openai` / `gemini` / `auto`（既定: `auto` = OpenAI 優先） |
+| `OPENAI_API_KEY` | バックエンド | OpenAI 互換 API キー（既定プロバイダ） |
 | `OPENAI_BASE_URL` | バックエンド | OpenAI 互換 API のベース URL（既定: `https://api.openai.com/v1`） |
 | `OPENAI_API_BASE` | バックエンド | `OPENAI_BASE_URL` の別名 |
 | `OPENAI_MODEL` | バックエンド | OpenAI 互換 API のモデル名（既定: `gpt-4o-mini`） |
+| `OPENAI_TIMEOUT` | バックエンド | OpenAI 互換 API のタイムアウト秒（既定: `60`） |
+| `OPENAI_MAX_RETRIES` | バックエンド | 429 / 5xx 時の最大再試行回数（既定: `2`） |
+| `OPENAI_RETRY_BACKOFF_SEC` | バックエンド | 再試行の初回待機秒（既定: `1.0`） |
+| `GEMINI_API_KEY` | バックエンド | Gemini API キー（フォールバック / `LLM_PROVIDER=gemini`） |
+| `GEMINI_MODEL` | バックエンド | Gemini のモデル名（既定: `gemini-3.5-flash-lite`） |
+| `LLM_TIMEOUT_MS` | バックエンド | Gemini の HTTP タイムアウト（ms、既定: `60000`） |
 | `LLM_WEB_SEARCH` | バックエンド | `0` / `false` / `off` / `no` で Web 検索ツールを無効化（既定: 有効） |
 | `VITE_API_BASE_URL` | フロントエンド | バックエンドのベース URL（既定: `http://localhost:8000`） |
